@@ -87,25 +87,39 @@ impl ParseStats {
     }
 }
 
-/// `Ok(Some(kmh))` = a usable limit, `Ok(None)` = recognised but not a number
-/// (`none`, `signals`), `Err(())` = unparseable, worth counting.
-pub fn parse_maxspeed(raw: &str) -> Result<Option<f64>, ()> {
+/// What a `maxspeed` tag turned out to be.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MaxSpeed {
+    /// A usable limit in km/h.
+    Kmh(f64),
+    /// Recognised, but not a number (`none`, `signals`): use the class default.
+    Unposted,
+    /// Could not be read at all. Worth counting - the histogram of these is how
+    /// you find out what the local mappers actually write.
+    Unreadable,
+}
+
+pub fn parse_maxspeed(raw: &str) -> MaxSpeed {
     let s = raw.trim().to_ascii_lowercase();
     if s.is_empty() || s == "none" || s == "signals" || s == "variable" || s == "unposted" {
-        return Ok(None);
+        return MaxSpeed::Unposted;
     }
-    let split = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let split = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
-    let v: f64 = num.parse().map_err(|_| ())?;
+    let Ok(v) = num.parse::<f64>() else {
+        return MaxSpeed::Unreadable;
+    };
     if !(v.is_finite() && v > 0.0) {
-        return Err(());
+        return MaxSpeed::Unreadable;
     }
-    Ok(Some(match unit.trim() {
+    MaxSpeed::Kmh(match unit.trim() {
         "" | "km/h" | "kmh" | "kph" | "kmph" => v,
         "mph" => v * 1.609_344,
         "knots" => v * 1.852,
-        _ => return Err(()),
-    }))
+        _ => return MaxSpeed::Unreadable,
+    })
 }
 
 /// `Some((class ordinal, is_link))` for a routable `highway` value.
@@ -194,12 +208,12 @@ pub fn read_ways(path: &Path) -> osmpbf::Result<(Vec<Way>, ParseStats)> {
             Some(raw) => {
                 stats.maxspeed_present += 1;
                 match parse_maxspeed(raw) {
-                    Ok(Some(v)) => {
+                    MaxSpeed::Kmh(v) => {
                         stats.maxspeed_parsed += 1;
                         v
                     }
-                    Ok(None) => default_kmh,
-                    Err(()) => {
+                    MaxSpeed::Unposted => default_kmh,
+                    MaxSpeed::Unreadable => {
                         *stats.maxspeed_unparsed.entry(raw.to_string()).or_insert(0) += 1;
                         default_kmh
                     }
@@ -223,13 +237,20 @@ pub fn read_ways(path: &Path) -> osmpbf::Result<(Vec<Way>, ParseStats)> {
             speed_kmh,
             oneway,
             name: name.map(str::to_string),
-            penalty: if parking_aisle { PARKING_AISLE_PENALTY } else { 1.0 },
+            penalty: if parking_aisle {
+                PARKING_AISLE_PENALTY
+            } else {
+                1.0
+            },
             flags,
         });
     })?;
 
     Ok((ways, stats))
 }
+
+/// OSM node id -> `(lon, lat)`. Dropped once dense ids are assigned.
+pub type NodeCoords = HashMap<i64, (f64, f64)>;
 
 /// Node ids carrying a routing-relevant tag, so graph construction can force
 /// them to be intersection nodes even at refcount 1.
@@ -241,10 +262,7 @@ pub struct TaggedNodes {
 
 /// Second pass: coordinates as `(lon, lat)` for `needed` only, plus the
 /// routing-relevant node tags encountered along the way.
-pub fn read_nodes(
-    path: &Path,
-    needed: &HashSet<i64>,
-) -> osmpbf::Result<(HashMap<i64, (f64, f64)>, TaggedNodes)> {
+pub fn read_nodes(path: &Path, needed: &HashSet<i64>) -> osmpbf::Result<(NodeCoords, TaggedNodes)> {
     let mut coords: HashMap<i64, (f64, f64)> = HashMap::with_capacity(needed.len());
     let mut tagged = TaggedNodes::default();
 
@@ -285,15 +303,17 @@ mod tests {
 
     #[test]
     fn maxspeed_forms() {
-        assert_eq!(parse_maxspeed("50"), Ok(Some(50.0)));
-        assert_eq!(parse_maxspeed("50 km/h"), Ok(Some(50.0)));
-        assert_eq!(parse_maxspeed(" 50kmh "), Ok(Some(50.0)));
-        assert_eq!(parse_maxspeed("none"), Ok(None));
-        let mph = parse_maxspeed("30 mph").unwrap().unwrap();
+        assert_eq!(parse_maxspeed("50"), MaxSpeed::Kmh(50.0));
+        assert_eq!(parse_maxspeed("50 km/h"), MaxSpeed::Kmh(50.0));
+        assert_eq!(parse_maxspeed(" 50kmh "), MaxSpeed::Kmh(50.0));
+        assert_eq!(parse_maxspeed("none"), MaxSpeed::Unposted);
+        let MaxSpeed::Kmh(mph) = parse_maxspeed("30 mph") else {
+            panic!("30 mph should parse")
+        };
         assert!((mph - 48.28).abs() < 0.01, "{mph}");
-        assert_eq!(parse_maxspeed("IN:urban"), Err(()));
-        assert_eq!(parse_maxspeed("fast"), Err(()));
-        assert_eq!(parse_maxspeed("0"), Err(()));
+        assert_eq!(parse_maxspeed("IN:urban"), MaxSpeed::Unreadable);
+        assert_eq!(parse_maxspeed("fast"), MaxSpeed::Unreadable);
+        assert_eq!(parse_maxspeed("0"), MaxSpeed::Unreadable);
     }
 
     #[test]

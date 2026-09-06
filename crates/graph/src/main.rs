@@ -51,7 +51,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t2 = Instant::now();
     let (back, back_hash) = graph::Graph::load(&out)?;
     let load_ms = t2.elapsed().as_millis();
-    assert_eq!(back_hash, hash, "source hash did not survive the round trip");
+    assert_eq!(
+        back_hash, hash,
+        "source hash did not survive the round trip"
+    );
     assert_eq!(
         back.to_bytes(back_hash),
         std::fs::read(&out)?,
@@ -79,7 +82,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (v, c) in p.top_unparsed(5) {
         println!("                    {c:>5} x {v:?}");
     }
-    println!("roundabouts       {} implied oneway", p.roundabout_implied_oneway);
+    println!(
+        "roundabouts       {} implied oneway",
+        p.roundabout_implied_oneway
+    );
     println!();
     println!("referenced nodes  {}", s.referenced_nodes);
     println!(
@@ -98,7 +104,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("geometry points   {}", s.geometry_points);
     println!("road length       {:.1} km", s.road_length_km);
     println!("missing coords    {}", s.missing_coords);
-    println!("max edge speed    {:.1} km/h", g.max_speed_m_per_ms() * 3600.0);
+    println!(
+        "max edge speed    {:.1} km/h",
+        g.max_speed_m_per_ms() * 3600.0
+    );
     println!();
     println!(
         "build {build_ms} ms, save {save_ms} ms, load {load_ms} ms, {} bytes -> {}",

@@ -105,6 +105,18 @@ impl Graph {
 // construction
 // ---------------------------------------------------------------------------
 
+/// One directed edge as emitted from a way, still keyed by OSM node id.
+struct PendingEdge {
+    a: i64,
+    b: i64,
+    weight: u32,
+    length: f32,
+    flags: u8,
+    name_id: u32,
+    geom: Vec<[f32; 2]>,
+    primary: bool,
+}
+
 /// One directed edge before it is packed into CSR.
 struct RawEdge {
     src: u32,
@@ -134,7 +146,7 @@ pub struct BuildStats {
     pub geometry_points: usize,
     pub road_length_km: f64,
     /// Way node refs whose coordinates were not in the extract. Should be 0
-    /// with `--complete-ways`; anything else means the clip was wrong.
+    /// with complete_ways; anything else means the clip was wrong.
     pub missing_coords: usize,
 }
 
@@ -147,7 +159,10 @@ impl BuildStats {
 
 pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Error>> {
     let (ways, parse) = osm_parse::read_ways(pbf)?;
-    let mut stats = BuildStats { parse, ..Default::default() };
+    let mut stats = BuildStats {
+        parse,
+        ..Default::default()
+    };
 
     // Pass 1: reference counts over retained ways decide what is a junction.
     let mut refc: HashMap<i64, u32> = HashMap::new();
@@ -164,8 +179,11 @@ pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Erro
 
     // A junction is shared by two or more ways, or is a way endpoint, or carries
     // a tag that routing cares about. Everything else is just geometry.
-    let mut is_junction: HashSet<i64> =
-        refc.iter().filter(|(_, c)| **c >= 2).map(|(k, _)| *k).collect();
+    let mut is_junction: HashSet<i64> = refc
+        .iter()
+        .filter(|(_, c)| **c >= 2)
+        .map(|(k, _)| *k)
+        .collect();
     for w in &ways {
         is_junction.insert(w.nodes[0]);
         is_junction.insert(*w.nodes.last().unwrap());
@@ -176,7 +194,7 @@ pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Erro
     stats.intersection_nodes = is_junction.len();
 
     // Pass 3: split each way into runs of geometry between consecutive junctions.
-    let mut raw: Vec<(i64, i64, u32, f32, u8, u32, Vec<[f32; 2]>, bool)> = Vec::new();
+    let mut raw: Vec<PendingEdge> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut name_ids: HashMap<String, u32> = HashMap::new();
 
@@ -194,24 +212,27 @@ pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Erro
     stats.edges_before_scc = raw.len();
 
     // Dense ids, assigned in sorted OSM-id order so a rebuild is deterministic.
-    let mut used: Vec<i64> = raw.iter().flat_map(|e| [e.0, e.1]).collect();
+    let mut used: Vec<i64> = raw.iter().flat_map(|e| [e.a, e.b]).collect();
     used.sort_unstable();
     used.dedup();
-    let dense: HashMap<i64, u32> =
-        used.iter().enumerate().map(|(i, id)| (*id, i as u32)).collect();
+    let dense: HashMap<i64, u32> = used
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i as u32))
+        .collect();
     let n = used.len();
 
     let edges: Vec<RawEdge> = raw
         .into_iter()
-        .map(|(a, b, weight, length, flags, name_id, geom, primary)| RawEdge {
-            src: dense[&a],
-            dst: dense[&b],
-            weight,
-            length,
-            flags,
-            name_id,
-            geom,
-            primary,
+        .map(|e| RawEdge {
+            src: dense[&e.a],
+            dst: dense[&e.b],
+            weight: e.weight,
+            length: e.length,
+            flags: e.flags,
+            name_id: e.name_id,
+            geom: e.geom,
+            primary: e.primary,
         })
         .collect();
 
@@ -230,7 +251,8 @@ pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Erro
         .map(|(i, _)| i as u32)
         .unwrap_or(0);
     stats.scc_count = sizes.len();
-    stats.scc_node_fraction = sizes.get(largest as usize).copied().unwrap_or(0) as f64 / n.max(1) as f64;
+    stats.scc_node_fraction =
+        sizes.get(largest as usize).copied().unwrap_or(0) as f64 / n.max(1) as f64;
 
     let keep: Vec<bool> = comp.iter().map(|c| *c == largest).collect();
     let mut remap = vec![u32::MAX; n];
@@ -258,8 +280,12 @@ pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Erro
 
     stats.nodes_kept = lon.len();
     stats.edges = kept.len();
-    stats.road_length_km =
-        kept.iter().filter(|e| e.primary).map(|e| e.length as f64).sum::<f64>() / 1000.0;
+    stats.road_length_km = kept
+        .iter()
+        .filter(|e| e.primary)
+        .map(|e| e.length as f64)
+        .sum::<f64>()
+        / 1000.0;
 
     let g = assemble(lon, lat, osm_id, kept, names);
     stats.geometry_points = g.geom.len();
@@ -276,7 +302,7 @@ fn emit_way(
     mps: f64,
     coords: &HashMap<i64, (f64, f64)>,
     is_junction: &HashSet<i64>,
-    out: &mut Vec<(i64, i64, u32, f32, u8, u32, Vec<[f32; 2]>, bool)>,
+    out: &mut Vec<PendingEdge>,
     stats: &mut BuildStats,
 ) {
     let mut start: Option<i64> = None;
@@ -286,7 +312,7 @@ fn emit_way(
 
     for &nid in &w.nodes {
         let Some(&c) = coords.get(&nid) else {
-            // Should not happen with --complete-ways; break the run if it does.
+            // Should not happen with complete_ways; break the run if it does.
             stats.missing_coords += 1;
             start = None;
             poly.clear();
@@ -322,13 +348,31 @@ fn emit_way(
             let reverse = w.oneway != Oneway::Forward;
             let mut primary = true;
             if forward {
-                out.push((a, nid, ms, acc as f32, w.flags, name_id, poly.clone(), primary));
+                out.push(PendingEdge {
+                    a,
+                    b: nid,
+                    weight: ms,
+                    length: acc as f32,
+                    flags: w.flags,
+                    name_id,
+                    geom: poly.clone(),
+                    primary,
+                });
                 primary = false;
             }
             if reverse {
                 let mut back = poly.clone();
                 back.reverse();
-                out.push((nid, a, ms, acc as f32, w.flags, name_id, back, primary));
+                out.push(PendingEdge {
+                    a: nid,
+                    b: a,
+                    weight: ms,
+                    length: acc as f32,
+                    flags: w.flags,
+                    name_id,
+                    geom: back,
+                    primary,
+                });
             }
         }
         start = Some(nid);
@@ -382,7 +426,11 @@ fn assemble(
     geom_off.push(geom.len() as u32);
 
     // Reverse CSR: bucket every edge by its target.
-    let mut rev: Vec<(u32, u32)> = edges.iter().enumerate().map(|(i, e)| (e.dst, i as u32)).collect();
+    let mut rev: Vec<(u32, u32)> = edges
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.dst, i as u32))
+        .collect();
     rev.sort_unstable();
     let r_offsets = csr_offsets(n, rev.iter().map(|(d, _)| *d));
     let r_head = rev.iter().map(|(_, i)| edges[*i as usize].src).collect();
@@ -544,7 +592,10 @@ impl Graph {
         let mut magic = [0u8; 8];
         inp.read_exact(&mut magic)?;
         if &magic != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a graph file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a graph file",
+            ));
         }
         let version = r_u32(inp, 1)?[0];
         if version != FORMAT_VERSION {
@@ -579,13 +630,15 @@ impl Graph {
         let r_head = r_u32(inp, m)?;
         let r_edge = r_u32(inp, m)?;
         let flat = r_f32(inp, ng * 2)?;
-        let geom = flat.chunks_exact(2).map(|c| [c[0], c[1]]).collect();
+        let geom = flat.as_chunks::<2>().0.to_vec();
         let mut names = Vec::with_capacity(nn);
         for _ in 0..nn {
             let len = r_u32(inp, 1)?[0] as usize;
             let mut b = vec![0u8; len];
             inp.read_exact(&mut b)?;
-            names.push(String::from_utf8(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
+            names.push(
+                String::from_utf8(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            );
         }
 
         Ok((
@@ -649,7 +702,7 @@ mod tests {
 
     #[test]
     fn haversine_known_distance() {
-        // Sector 17 Plaza to Sukhna Lake, about 3.4 km apart.
+        // Sector 17 Plaza to Sukhna Lake, about 3 km apart.
         let d = haversine((76.7794, 30.7410), (76.8106, 30.7423));
         assert!((d - 2990.0).abs() < 60.0, "{d}");
         assert_eq!(haversine((76.7, 30.7), (76.7, 30.7)), 0.0);
@@ -669,14 +722,31 @@ mod tests {
         assert_eq!(comp[0], comp[1]);
         assert_eq!(comp[1], comp[2]);
         assert_ne!(comp[3], comp[0]);
-        let largest = *sizes.iter().max().unwrap();
-        assert_eq!(largest, 3);
+        assert_eq!(*sizes.iter().max().unwrap(), 3);
     }
 
     fn tiny_graph() -> Graph {
         let edges = vec![
-            RawEdge { src: 0, dst: 1, weight: 1200, length: 10.0, flags: 6, name_id: 0, geom: vec![[76.7, 30.7], [76.8, 30.8]], primary: true },
-            RawEdge { src: 1, dst: 0, weight: 1200, length: 10.0, flags: 6, name_id: 0, geom: vec![[76.8, 30.8], [76.7, 30.7]], primary: false },
+            RawEdge {
+                src: 0,
+                dst: 1,
+                weight: 1200,
+                length: 10.0,
+                flags: 6,
+                name_id: 0,
+                geom: vec![[76.7, 30.7], [76.8, 30.8]],
+                primary: true,
+            },
+            RawEdge {
+                src: 1,
+                dst: 0,
+                weight: 1200,
+                length: 10.0,
+                flags: 6,
+                name_id: 0,
+                geom: vec![[76.8, 30.8], [76.7, 30.7]],
+                primary: false,
+            },
         ];
         assemble(
             vec![76.7, 76.8],
