@@ -1,0 +1,5 @@
+data/raw/
+data/build/
+target/
+node_modules/
+tools/bin/

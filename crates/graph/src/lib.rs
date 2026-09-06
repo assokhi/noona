@@ -1,0 +1,714 @@
+//! In-memory CSR routing graph: construction from OSM ways, largest-SCC
+//! filtering, and the versioned on-disk format.
+//!
+//! Conventions, asserted at every boundary:
+//! - coordinates are `(lon, lat)`, matching GeoJSON
+//! - distances are metres (f64), accumulated in f64 and only stored as f32
+//! - edge weights are milliseconds (u32), so the priority queue stays integral
+//! - node ids are dense u32 indices, NOT OSM ids (`osm_id` is a debug side table)
+
+use osm_parse::{Oneway, Way};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::Path;
+
+/// IUGG mean earth radius.
+pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
+
+/// Great-circle distance in metres between two `(lon, lat)` points.
+pub fn haversine(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (lon1, lat1) = (a.0.to_radians(), a.1.to_radians());
+    let (lon2, lat2) = (b.0.to_radians(), b.1.to_radians());
+    let (dlon, dlat) = (lon2 - lon1, lat2 - lat1);
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * h.sqrt().asin()
+}
+
+/// Sentinel in `name_id` for an edge whose way had no `name` tag.
+pub const NO_NAME: u32 = u32::MAX;
+
+pub struct Graph {
+    // --- per node ---
+    pub lon: Vec<f64>,
+    pub lat: Vec<f64>,
+    /// Internal id -> OSM node id. Debugging only; nothing routes on this.
+    pub osm_id: Vec<i64>,
+
+    // --- forward CSR, indexed by node then by edge ---
+    /// Length `n_nodes + 1`.
+    pub offsets: Vec<u32>,
+    pub head: Vec<u32>,
+    /// Travel time in milliseconds.
+    pub weight: Vec<u32>,
+    /// Length in metres, summed along the polyline.
+    pub length: Vec<f32>,
+    /// Length `n_edges + 1`, indexes into `geom`.
+    pub geom_off: Vec<u32>,
+    pub flags: Vec<u8>,
+    pub name_id: Vec<u32>,
+
+    // --- reverse CSR: at node v, the edges arriving at v ---
+    /// Length `n_nodes + 1`.
+    pub r_offsets: Vec<u32>,
+    /// Tail node of the incoming edge.
+    pub r_head: Vec<u32>,
+    /// Forward edge id, so weight and geometry are one indirection away
+    /// instead of duplicated.
+    pub r_edge: Vec<u32>,
+
+    /// Flat `(lon, lat)` polyline points, both endpoints included.
+    pub geom: Vec<[f32; 2]>,
+    pub names: Vec<String>,
+}
+
+impl Graph {
+    pub fn n_nodes(&self) -> usize {
+        self.lon.len()
+    }
+    pub fn n_edges(&self) -> usize {
+        self.head.len()
+    }
+    /// Edge ids leaving `v`.
+    pub fn out_edges(&self, v: u32) -> std::ops::Range<usize> {
+        self.offsets[v as usize] as usize..self.offsets[v as usize + 1] as usize
+    }
+    /// Reverse-CSR slots arriving at `v`.
+    pub fn in_edges(&self, v: u32) -> std::ops::Range<usize> {
+        self.r_offsets[v as usize] as usize..self.r_offsets[v as usize + 1] as usize
+    }
+    pub fn geometry(&self, edge: usize) -> &[[f32; 2]] {
+        &self.geom[self.geom_off[edge] as usize..self.geom_off[edge + 1] as usize]
+    }
+    pub fn name(&self, edge: usize) -> Option<&str> {
+        match self.name_id[edge] {
+            NO_NAME => None,
+            i => Some(&self.names[i as usize]),
+        }
+    }
+    pub fn coord(&self, v: u32) -> (f64, f64) {
+        (self.lon[v as usize], self.lat[v as usize])
+    }
+    /// Fastest edge in the graph, in metres per millisecond. This is the value
+    /// an admissible A* heuristic must divide by - the *maximum* speed, never
+    /// the average.
+    pub fn max_speed_m_per_ms(&self) -> f64 {
+        self.length
+            .iter()
+            .zip(&self.weight)
+            .map(|(l, w)| *l as f64 / *w as f64)
+            .fold(0.0, f64::max)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// construction
+// ---------------------------------------------------------------------------
+
+/// One directed edge before it is packed into CSR.
+struct RawEdge {
+    src: u32,
+    dst: u32,
+    weight: u32,
+    length: f32,
+    flags: u8,
+    name_id: u32,
+    geom: Vec<[f32; 2]>,
+    /// First of the (up to two) directions emitted for one road segment.
+    /// Used only so total road length is not double counted.
+    primary: bool,
+}
+
+#[derive(Default, Debug)]
+pub struct BuildStats {
+    pub parse: osm_parse::ParseStats,
+    /// Distinct OSM nodes referenced by retained ways.
+    pub referenced_nodes: usize,
+    /// Of those, the ones that survive degree-2 contraction.
+    pub intersection_nodes: usize,
+    pub nodes_kept: usize,
+    pub edges_before_scc: usize,
+    pub edges: usize,
+    pub scc_count: usize,
+    pub scc_node_fraction: f64,
+    pub geometry_points: usize,
+    pub road_length_km: f64,
+    /// Way node refs whose coordinates were not in the extract. Should be 0
+    /// with `--complete-ways`; anything else means the clip was wrong.
+    pub missing_coords: usize,
+}
+
+impl BuildStats {
+    /// How many referenced nodes collapse into one intersection node.
+    pub fn contraction_ratio(&self) -> f64 {
+        self.referenced_nodes as f64 / self.intersection_nodes.max(1) as f64
+    }
+}
+
+pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Error>> {
+    let (ways, parse) = osm_parse::read_ways(pbf)?;
+    let mut stats = BuildStats { parse, ..Default::default() };
+
+    // Pass 1: reference counts over retained ways decide what is a junction.
+    let mut refc: HashMap<i64, u32> = HashMap::new();
+    for w in &ways {
+        for n in &w.nodes {
+            *refc.entry(*n).or_insert(0) += 1;
+        }
+    }
+    stats.referenced_nodes = refc.len();
+    let needed: HashSet<i64> = refc.keys().copied().collect();
+
+    // Pass 2: coordinates for those nodes only, plus routing-relevant node tags.
+    let (coords, tagged) = osm_parse::read_nodes(pbf, &needed)?;
+
+    // A junction is shared by two or more ways, or is a way endpoint, or carries
+    // a tag that routing cares about. Everything else is just geometry.
+    let mut is_junction: HashSet<i64> =
+        refc.iter().filter(|(_, c)| **c >= 2).map(|(k, _)| *k).collect();
+    for w in &ways {
+        is_junction.insert(w.nodes[0]);
+        is_junction.insert(*w.nodes.last().unwrap());
+    }
+    is_junction.extend(&tagged.signals);
+    is_junction.extend(&tagged.barriers);
+    is_junction.retain(|id| coords.contains_key(id));
+    stats.intersection_nodes = is_junction.len();
+
+    // Pass 3: split each way into runs of geometry between consecutive junctions.
+    let mut raw: Vec<(i64, i64, u32, f32, u8, u32, Vec<[f32; 2]>, bool)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut name_ids: HashMap<String, u32> = HashMap::new();
+
+    for w in &ways {
+        let name_id = match &w.name {
+            Some(n) => *name_ids.entry(n.clone()).or_insert_with(|| {
+                names.push(n.clone());
+                (names.len() - 1) as u32
+            }),
+            None => NO_NAME,
+        };
+        let mps = w.speed_kmh / 3.6;
+        emit_way(w, name_id, mps, &coords, &is_junction, &mut raw, &mut stats);
+    }
+    stats.edges_before_scc = raw.len();
+
+    // Dense ids, assigned in sorted OSM-id order so a rebuild is deterministic.
+    let mut used: Vec<i64> = raw.iter().flat_map(|e| [e.0, e.1]).collect();
+    used.sort_unstable();
+    used.dedup();
+    let dense: HashMap<i64, u32> =
+        used.iter().enumerate().map(|(i, id)| (*id, i as u32)).collect();
+    let n = used.len();
+
+    let edges: Vec<RawEdge> = raw
+        .into_iter()
+        .map(|(a, b, weight, length, flags, name_id, geom, primary)| RawEdge {
+            src: dense[&a],
+            dst: dense[&b],
+            weight,
+            length,
+            flags,
+            name_id,
+            geom,
+            primary,
+        })
+        .collect();
+
+    // Largest strongly connected component. OSM is full of isolated fragments -
+    // a service road with a mistagged oneway, a way whose only connection sat
+    // outside the bbox. Without this you get unroutable pairs at random.
+    let offsets = csr_offsets(n, edges.iter().map(|e| e.src));
+    let mut by_src: Vec<u32> = (0..edges.len() as u32).collect();
+    by_src.sort_by_key(|i| edges[*i as usize].src);
+    let head: Vec<u32> = by_src.iter().map(|i| edges[*i as usize].dst).collect();
+    let (comp, sizes) = scc(n, &offsets, &head);
+    let largest = sizes
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, s)| **s)
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0);
+    stats.scc_count = sizes.len();
+    stats.scc_node_fraction = sizes.get(largest as usize).copied().unwrap_or(0) as f64 / n.max(1) as f64;
+
+    let keep: Vec<bool> = comp.iter().map(|c| *c == largest).collect();
+    let mut remap = vec![u32::MAX; n];
+    let mut lon = Vec::new();
+    let mut lat = Vec::new();
+    let mut osm_id = Vec::new();
+    for (old, osm) in used.iter().enumerate() {
+        if keep[old] {
+            remap[old] = lon.len() as u32;
+            let c = coords[osm];
+            lon.push(c.0);
+            lat.push(c.1);
+            osm_id.push(*osm);
+        }
+    }
+    let kept: Vec<RawEdge> = edges
+        .into_iter()
+        .filter(|e| keep[e.src as usize] && keep[e.dst as usize])
+        .map(|mut e| {
+            e.src = remap[e.src as usize];
+            e.dst = remap[e.dst as usize];
+            e
+        })
+        .collect();
+
+    stats.nodes_kept = lon.len();
+    stats.edges = kept.len();
+    stats.road_length_km =
+        kept.iter().filter(|e| e.primary).map(|e| e.length as f64).sum::<f64>() / 1000.0;
+
+    let g = assemble(lon, lat, osm_id, kept, names);
+    stats.geometry_points = g.geom.len();
+    Ok((g, stats))
+}
+
+/// Walk one way, emitting an edge per run of geometry between two consecutive
+/// junction nodes. Edge length is summed along the polyline, never taken from
+/// the straight line between endpoints.
+#[allow(clippy::too_many_arguments)]
+fn emit_way(
+    w: &Way,
+    name_id: u32,
+    mps: f64,
+    coords: &HashMap<i64, (f64, f64)>,
+    is_junction: &HashSet<i64>,
+    out: &mut Vec<(i64, i64, u32, f32, u8, u32, Vec<[f32; 2]>, bool)>,
+    stats: &mut BuildStats,
+) {
+    let mut start: Option<i64> = None;
+    let mut poly: Vec<[f32; 2]> = Vec::new();
+    let mut prev: Option<(f64, f64)> = None;
+    let mut acc = 0.0f64;
+
+    for &nid in &w.nodes {
+        let Some(&c) = coords.get(&nid) else {
+            // Should not happen with --complete-ways; break the run if it does.
+            stats.missing_coords += 1;
+            start = None;
+            poly.clear();
+            prev = None;
+            acc = 0.0;
+            continue;
+        };
+        let p = [c.0 as f32, c.1 as f32];
+
+        if start.is_none() {
+            if is_junction.contains(&nid) {
+                start = Some(nid);
+                poly.clear();
+                poly.push(p);
+                prev = Some(c);
+                acc = 0.0;
+            }
+            continue;
+        }
+
+        acc += haversine(prev.unwrap(), c);
+        poly.push(p);
+        prev = Some(c);
+
+        if !is_junction.contains(&nid) {
+            continue;
+        }
+
+        let a = start.unwrap();
+        if a != nid && acc > 0.0 {
+            let ms = ((acc / mps) * 1000.0 * w.penalty as f64).round().max(1.0) as u32;
+            let forward = w.oneway != Oneway::Reverse;
+            let reverse = w.oneway != Oneway::Forward;
+            let mut primary = true;
+            if forward {
+                out.push((a, nid, ms, acc as f32, w.flags, name_id, poly.clone(), primary));
+                primary = false;
+            }
+            if reverse {
+                let mut back = poly.clone();
+                back.reverse();
+                out.push((nid, a, ms, acc as f32, w.flags, name_id, back, primary));
+            }
+        }
+        start = Some(nid);
+        poly.clear();
+        poly.push(p);
+        acc = 0.0;
+    }
+}
+
+/// CSR offsets from an iterator of source ids. Length `n + 1`.
+fn csr_offsets(n: usize, srcs: impl Iterator<Item = u32>) -> Vec<u32> {
+    let mut off = vec![0u32; n + 1];
+    for s in srcs {
+        off[s as usize + 1] += 1;
+    }
+    for i in 1..=n {
+        off[i] += off[i - 1];
+    }
+    off
+}
+
+fn assemble(
+    lon: Vec<f64>,
+    lat: Vec<f64>,
+    osm_id: Vec<i64>,
+    mut edges: Vec<RawEdge>,
+    names: Vec<String>,
+) -> Graph {
+    let n = lon.len();
+    // Deterministic order: by source, then target, then weight.
+    edges.sort_by_key(|e| (e.src, e.dst, e.weight));
+
+    let offsets = csr_offsets(n, edges.iter().map(|e| e.src));
+    let m = edges.len();
+    let mut head = Vec::with_capacity(m);
+    let mut weight = Vec::with_capacity(m);
+    let mut length = Vec::with_capacity(m);
+    let mut flags = Vec::with_capacity(m);
+    let mut name_id = Vec::with_capacity(m);
+    let mut geom_off = Vec::with_capacity(m + 1);
+    let mut geom = Vec::new();
+    for e in &edges {
+        head.push(e.dst);
+        weight.push(e.weight);
+        length.push(e.length);
+        flags.push(e.flags);
+        name_id.push(e.name_id);
+        geom_off.push(geom.len() as u32);
+        geom.extend_from_slice(&e.geom);
+    }
+    geom_off.push(geom.len() as u32);
+
+    // Reverse CSR: bucket every edge by its target.
+    let mut rev: Vec<(u32, u32)> = edges.iter().enumerate().map(|(i, e)| (e.dst, i as u32)).collect();
+    rev.sort_unstable();
+    let r_offsets = csr_offsets(n, rev.iter().map(|(d, _)| *d));
+    let r_head = rev.iter().map(|(_, i)| edges[*i as usize].src).collect();
+    let r_edge = rev.iter().map(|(_, i)| *i).collect();
+
+    Graph {
+        lon,
+        lat,
+        osm_id,
+        offsets,
+        head,
+        weight,
+        length,
+        geom_off,
+        flags,
+        name_id,
+        r_offsets,
+        r_head,
+        r_edge,
+        geom,
+        names,
+    }
+}
+
+/// Iterative Tarjan. Returns `(component per node, size per component)`.
+/// Iterative because 10^5 nodes will overflow the stack in the recursive form.
+pub fn scc(n: usize, offsets: &[u32], head: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    const UNVISITED: u32 = u32::MAX;
+    let mut index = vec![UNVISITED; n];
+    let mut low = vec![0u32; n];
+    let mut on_stack = vec![false; n];
+    let mut comp = vec![UNVISITED; n];
+    let mut sizes: Vec<u32> = Vec::new();
+    let mut stack: Vec<u32> = Vec::new();
+    let mut call: Vec<(u32, u32)> = Vec::new(); // (node, next edge cursor)
+    let mut next_index = 0u32;
+
+    for s in 0..n as u32 {
+        if index[s as usize] != UNVISITED {
+            continue;
+        }
+        index[s as usize] = next_index;
+        low[s as usize] = next_index;
+        next_index += 1;
+        stack.push(s);
+        on_stack[s as usize] = true;
+        call.push((s, offsets[s as usize]));
+
+        while let Some(&(v, ei)) = call.last() {
+            if ei < offsets[v as usize + 1] {
+                call.last_mut().unwrap().1 = ei + 1;
+                let w = head[ei as usize];
+                if index[w as usize] == UNVISITED {
+                    index[w as usize] = next_index;
+                    low[w as usize] = next_index;
+                    next_index += 1;
+                    stack.push(w);
+                    on_stack[w as usize] = true;
+                    call.push((w, offsets[w as usize]));
+                } else if on_stack[w as usize] {
+                    low[v as usize] = low[v as usize].min(index[w as usize]);
+                }
+                continue;
+            }
+
+            call.pop();
+            if low[v as usize] == index[v as usize] {
+                let id = sizes.len() as u32;
+                let mut size = 0u32;
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w as usize] = false;
+                    comp[w as usize] = id;
+                    size += 1;
+                    if w == v {
+                        break;
+                    }
+                }
+                sizes.push(size);
+            }
+            if let Some(&(parent, _)) = call.last() {
+                low[parent as usize] = low[parent as usize].min(low[v as usize]);
+            }
+        }
+    }
+    (comp, sizes)
+}
+
+// ---------------------------------------------------------------------------
+// serialisation: a header plus flat arrays, so loading is read_exact into
+// pre-sized vectors rather than deserialising a nested struct graph.
+// ---------------------------------------------------------------------------
+
+const MAGIC: &[u8; 8] = b"CHDGRAPH";
+pub const FORMAT_VERSION: u32 = 1;
+
+macro_rules! flat_io {
+    ($w:ident, $r:ident, $t:ty, $size:expr) => {
+        fn $w<W: Write>(out: &mut W, v: &[$t]) -> io::Result<()> {
+            let mut buf = Vec::with_capacity(v.len() * $size);
+            for x in v {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            out.write_all(&buf)
+        }
+        fn $r<R: Read>(inp: &mut R, n: usize) -> io::Result<Vec<$t>> {
+            let mut buf = vec![0u8; n * $size];
+            inp.read_exact(&mut buf)?;
+            Ok(buf
+                .chunks_exact($size)
+                .map(|c| <$t>::from_le_bytes(c.try_into().unwrap()))
+                .collect())
+        }
+    };
+}
+flat_io!(w_u32, r_u32, u32, 4);
+flat_io!(w_f32, r_f32, f32, 4);
+flat_io!(w_f64, r_f64, f64, 8);
+flat_io!(w_i64, r_i64, i64, 8);
+
+impl Graph {
+    /// `source_hash` identifies the extract this graph was built from.
+    pub fn write_to<W: Write>(&self, out: &mut W, source_hash: u64) -> io::Result<()> {
+        out.write_all(MAGIC)?;
+        w_u32(out, &[FORMAT_VERSION])?;
+        out.write_all(&source_hash.to_le_bytes())?;
+        w_u32(
+            out,
+            &[
+                self.n_nodes() as u32,
+                self.n_edges() as u32,
+                self.geom.len() as u32,
+                self.names.len() as u32,
+            ],
+        )?;
+        w_f64(out, &self.lon)?;
+        w_f64(out, &self.lat)?;
+        w_i64(out, &self.osm_id)?;
+        w_u32(out, &self.offsets)?;
+        w_u32(out, &self.head)?;
+        w_u32(out, &self.weight)?;
+        w_f32(out, &self.length)?;
+        w_u32(out, &self.geom_off)?;
+        out.write_all(&self.flags)?;
+        w_u32(out, &self.name_id)?;
+        w_u32(out, &self.r_offsets)?;
+        w_u32(out, &self.r_head)?;
+        w_u32(out, &self.r_edge)?;
+        let flat: Vec<f32> = self.geom.iter().flat_map(|p| [p[0], p[1]]).collect();
+        w_f32(out, &flat)?;
+        for s in &self.names {
+            w_u32(out, &[s.len() as u32])?;
+            out.write_all(s.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub fn read_from<R: Read>(inp: &mut R) -> io::Result<(Graph, u64)> {
+        let mut magic = [0u8; 8];
+        inp.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a graph file"));
+        }
+        let version = r_u32(inp, 1)?[0];
+        if version != FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("graph format v{version}, expected v{FORMAT_VERSION}"),
+            ));
+        }
+        let mut hash = [0u8; 8];
+        inp.read_exact(&mut hash)?;
+        let source_hash = u64::from_le_bytes(hash);
+        let counts = r_u32(inp, 4)?;
+        let (n, m, ng, nn) = (
+            counts[0] as usize,
+            counts[1] as usize,
+            counts[2] as usize,
+            counts[3] as usize,
+        );
+
+        let lon = r_f64(inp, n)?;
+        let lat = r_f64(inp, n)?;
+        let osm_id = r_i64(inp, n)?;
+        let offsets = r_u32(inp, n + 1)?;
+        let head = r_u32(inp, m)?;
+        let weight = r_u32(inp, m)?;
+        let length = r_f32(inp, m)?;
+        let geom_off = r_u32(inp, m + 1)?;
+        let mut flags = vec![0u8; m];
+        inp.read_exact(&mut flags)?;
+        let name_id = r_u32(inp, m)?;
+        let r_offsets = r_u32(inp, n + 1)?;
+        let r_head = r_u32(inp, m)?;
+        let r_edge = r_u32(inp, m)?;
+        let flat = r_f32(inp, ng * 2)?;
+        let geom = flat.chunks_exact(2).map(|c| [c[0], c[1]]).collect();
+        let mut names = Vec::with_capacity(nn);
+        for _ in 0..nn {
+            let len = r_u32(inp, 1)?[0] as usize;
+            let mut b = vec![0u8; len];
+            inp.read_exact(&mut b)?;
+            names.push(String::from_utf8(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
+        }
+
+        Ok((
+            Graph {
+                lon,
+                lat,
+                osm_id,
+                offsets,
+                head,
+                weight,
+                length,
+                geom_off,
+                flags,
+                name_id,
+                r_offsets,
+                r_head,
+                r_edge,
+                geom,
+                names,
+            },
+            source_hash,
+        ))
+    }
+
+    pub fn save(&self, path: &Path, source_hash: u64) -> io::Result<()> {
+        let mut w = BufWriter::new(File::create(path)?);
+        self.write_to(&mut w, source_hash)?;
+        w.flush()
+    }
+
+    pub fn load(path: &Path) -> io::Result<(Graph, u64)> {
+        Graph::read_from(&mut BufReader::new(File::open(path)?))
+    }
+
+    pub fn to_bytes(&self, source_hash: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        self.write_to(&mut v, source_hash).expect("in-memory write");
+        v
+    }
+}
+
+/// FNV-1a over a file, so the graph header can name the extract it came from.
+pub fn file_hash(path: &Path) -> io::Result<u64> {
+    let mut f = BufReader::new(File::open(path)?);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(h);
+        }
+        for b in &buf[..n] {
+            h = (h ^ *b as u64).wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn haversine_known_distance() {
+        // Sector 17 Plaza to Sukhna Lake, about 3.4 km apart.
+        let d = haversine((76.7794, 30.7410), (76.8106, 30.7423));
+        assert!((d - 2990.0).abs() < 60.0, "{d}");
+        assert_eq!(haversine((76.7, 30.7), (76.7, 30.7)), 0.0);
+    }
+
+    #[test]
+    fn scc_splits_a_dangling_tail() {
+        // 0<->1<->2 form a cycle back through 0; 3 is reachable but never returns.
+        let edges: [(u32, u32); 5] = [(0, 1), (1, 0), (1, 2), (2, 1), (1, 3)];
+        let n = 4;
+        let mut e = edges.to_vec();
+        e.sort();
+        let offsets = csr_offsets(n, e.iter().map(|(s, _)| *s));
+        let head: Vec<u32> = e.iter().map(|(_, d)| *d).collect();
+        let (comp, sizes) = scc(n, &offsets, &head);
+        assert_eq!(sizes.len(), 2);
+        assert_eq!(comp[0], comp[1]);
+        assert_eq!(comp[1], comp[2]);
+        assert_ne!(comp[3], comp[0]);
+        let largest = *sizes.iter().max().unwrap();
+        assert_eq!(largest, 3);
+    }
+
+    fn tiny_graph() -> Graph {
+        let edges = vec![
+            RawEdge { src: 0, dst: 1, weight: 1200, length: 10.0, flags: 6, name_id: 0, geom: vec![[76.7, 30.7], [76.8, 30.8]], primary: true },
+            RawEdge { src: 1, dst: 0, weight: 1200, length: 10.0, flags: 6, name_id: 0, geom: vec![[76.8, 30.8], [76.7, 30.7]], primary: false },
+        ];
+        assemble(
+            vec![76.7, 76.8],
+            vec![30.7, 30.8],
+            vec![111, 222],
+            edges,
+            vec!["Madhya Marg".to_string()],
+        )
+    }
+
+    #[test]
+    fn csr_and_reverse_agree() {
+        let g = tiny_graph();
+        assert_eq!(g.n_nodes(), 2);
+        assert_eq!(g.n_edges(), 2);
+        assert_eq!(g.offsets, vec![0, 1, 2]);
+        // the one edge arriving at node 1 comes from node 0
+        let inc: Vec<u32> = g.in_edges(1).map(|j| g.r_head[j]).collect();
+        assert_eq!(inc, vec![0]);
+        assert_eq!(g.geometry(0).len(), 2);
+        assert_eq!(g.name(0), Some("Madhya Marg"));
+        assert_eq!(g.max_speed_m_per_ms(), 10.0 / 1200.0);
+    }
+
+    #[test]
+    fn round_trip_is_byte_identical() {
+        let g = tiny_graph();
+        let bytes = g.to_bytes(0xdead_beef);
+        let (back, hash) = Graph::read_from(&mut &bytes[..]).unwrap();
+        assert_eq!(hash, 0xdead_beef);
+        assert_eq!(back.to_bytes(hash), bytes);
+        assert_eq!(back.lon, g.lon);
+        assert_eq!(back.names, g.names);
+    }
+}

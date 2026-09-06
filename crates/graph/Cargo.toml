@@ -1,0 +1,7 @@
+[package]
+name = "graph"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+osm-parse = { path = "../osm-parse" }
