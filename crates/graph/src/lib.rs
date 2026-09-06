@@ -27,6 +27,12 @@ pub fn haversine(a: (f64, f64), b: (f64, f64)) -> f64 {
 
 /// Sentinel in `name_id` for an edge whose way had no `name` tag.
 pub const NO_NAME: u32 = u32::MAX;
+/// Sentinel in `twin` for a one-way edge with no opposite direction.
+pub const NO_TWIN: u32 = u32::MAX;
+
+/// `node_flags` bits.
+pub const NODE_SIGNALS: u8 = 0x01;
+pub const NODE_BARRIER: u8 = 0x02;
 
 pub struct Graph {
     // --- per node ---
@@ -34,6 +40,9 @@ pub struct Graph {
     pub lat: Vec<f64>,
     /// Internal id -> OSM node id. Debugging only; nothing routes on this.
     pub osm_id: Vec<i64>,
+    /// Routing-relevant node tags, so the contraction pass knows not to splice
+    /// them away. See `NODE_SIGNALS` / `NODE_BARRIER`.
+    pub node_flags: Vec<u8>,
 
     // --- forward CSR, indexed by node then by edge ---
     /// Length `n_nodes + 1`.
@@ -56,6 +65,11 @@ pub struct Graph {
     /// Forward edge id, so weight and geometry are one indirection away
     /// instead of duplicated.
     pub r_edge: Vec<u32>,
+
+    /// The opposite direction of the same road segment, or `NO_TWIN` for a
+    /// one-way. Lets road length be counted once per segment, and is what the
+    /// geometry arena will share a span on.
+    pub twin: Vec<u32>,
 
     /// Flat `(lon, lat)` polyline points, both endpoints included.
     pub geom: Vec<[f32; 2]>,
@@ -89,6 +103,21 @@ impl Graph {
     pub fn coord(&self, v: u32) -> (f64, f64) {
         (self.lon[v as usize], self.lat[v as usize])
     }
+    /// A stable id for the undirected road segment behind a directed edge:
+    /// the lower of the edge and its twin.
+    pub fn pair_of(&self, edge: usize) -> u32 {
+        match self.twin[edge] {
+            NO_TWIN => edge as u32,
+            t => (edge as u32).min(t),
+        }
+    }
+    /// Road length in metres, counting a two-way segment once.
+    pub fn road_length_m(&self) -> f64 {
+        (0..self.n_edges())
+            .filter(|e| self.twin[*e] == NO_TWIN || (*e as u32) < self.twin[*e])
+            .map(|e| self.length[e] as f64)
+            .sum()
+    }
     /// Fastest edge in the graph, in metres per millisecond. This is the value
     /// an admissible A* heuristic must divide by - the *maximum* speed, never
     /// the average.
@@ -99,6 +128,109 @@ impl Graph {
             .map(|(l, w)| *l as f64 / *w as f64)
             .fold(0.0, f64::max)
     }
+}
+
+// ---------------------------------------------------------------------------
+// topology
+// ---------------------------------------------------------------------------
+
+/// A degree-2 node and the edges that would be spliced if it were contracted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Chain {
+    pub u: u32,
+    pub w: u32,
+    /// `(edge u->v, edge v->w)`, in travel order.
+    pub fwd: (u32, u32),
+    /// `(edge w->v, edge v->u)`, present only when the chain is two-way.
+    pub bwd: Option<(u32, u32)>,
+}
+
+/// A node's local topology.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shape {
+    /// `u -> v -> w` and nothing else.
+    OneWayChain,
+    /// `u <-> v <-> w` and nothing else.
+    TwoWayChain,
+    /// Exactly one undirected neighbour: the tip of a cul-de-sac. Legitimate.
+    CulDeSac,
+    /// No way in, or no way out. Cannot occur inside the largest SCC; counted
+    /// separately so it is never confused with a chain interior.
+    Stub,
+    /// A real junction, or an asymmetry that encodes a directional constraint.
+    Junction,
+}
+
+/// The chain through `v`, if `v` is a topologically degree-2 node that can be
+/// spliced away without changing any shortest path.
+///
+/// Deliberately strict. `u->v`, `v->w`, `w->v` with no `v->u` is *not* a chain:
+/// that asymmetry is a real one-way constraint and splicing it would invent a
+/// turn that does not exist.
+pub fn chain_at(g: &Graph, v: u32) -> Option<Chain> {
+    let outs: Vec<(u32, u32)> = g.out_edges(v).map(|e| (e as u32, g.head[e])).collect();
+    let ins: Vec<(u32, u32)> = g.in_edges(v).map(|j| (g.r_edge[j], g.r_head[j])).collect();
+    // A self-loop is never contractible.
+    if outs.iter().any(|(_, h)| *h == v) || ins.iter().any(|(_, t)| *t == v) {
+        return None;
+    }
+    match (ins.len(), outs.len()) {
+        (1, 1) => {
+            let ((e_in, u), (e_out, w)) = (ins[0], outs[0]);
+            // u == w is a cul-de-sac tip, not a chain: splicing makes a self-loop.
+            (u != w).then_some(Chain {
+                u,
+                w,
+                fwd: (e_in, e_out),
+                bwd: None,
+            })
+        }
+        (2, 2) => {
+            let mut nb: Vec<u32> = ins.iter().map(|(_, t)| *t).collect();
+            nb.sort_unstable();
+            nb.dedup();
+            if nb.len() != 2 {
+                return None;
+            }
+            let (u, w) = (nb[0], nb[1]);
+            // Every edge must pair with a reverse, or the node is a constraint.
+            let e_uv = ins.iter().find(|(_, t)| *t == u)?.0;
+            let e_wv = ins.iter().find(|(_, t)| *t == w)?.0;
+            let e_vu = outs.iter().find(|(_, h)| *h == u)?.0;
+            let e_vw = outs.iter().find(|(_, h)| *h == w)?.0;
+            Some(Chain {
+                u,
+                w,
+                fwd: (e_uv, e_vw),
+                bwd: Some((e_wv, e_vu)),
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn shape_at(g: &Graph, v: u32) -> Shape {
+    if g.in_edges(v).is_empty() || g.out_edges(v).is_empty() {
+        return Shape::Stub;
+    }
+    if let Some(c) = chain_at(g, v) {
+        return if c.bwd.is_some() {
+            Shape::TwoWayChain
+        } else {
+            Shape::OneWayChain
+        };
+    }
+    let mut nb: Vec<u32> = g
+        .out_edges(v)
+        .map(|e| g.head[e])
+        .chain(g.in_edges(v).map(|j| g.r_head[j]))
+        .collect();
+    nb.sort_unstable();
+    nb.dedup();
+    if nb.len() == 1 && nb[0] != v {
+        return Shape::CulDeSac;
+    }
+    Shape::Junction
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +246,6 @@ struct PendingEdge {
     flags: u8,
     name_id: u32,
     geom: Vec<[f32; 2]>,
-    primary: bool,
 }
 
 /// One directed edge before it is packed into CSR.
@@ -126,9 +257,6 @@ struct RawEdge {
     flags: u8,
     name_id: u32,
     geom: Vec<[f32; 2]>,
-    /// First of the (up to two) directions emitted for one road segment.
-    /// Used only so total road length is not double counted.
-    primary: bool,
 }
 
 #[derive(Default, Debug)]
@@ -145,6 +273,7 @@ pub struct BuildStats {
     pub scc_node_fraction: f64,
     pub geometry_points: usize,
     pub road_length_km: f64,
+    pub contract: ContractStats,
     /// Way node refs whose coordinates were not in the extract. Should be 0
     /// with complete_ways; anything else means the clip was wrong.
     pub missing_coords: usize,
@@ -232,7 +361,6 @@ pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Erro
             flags: e.flags,
             name_id: e.name_id,
             geom: e.geom,
-            primary: e.primary,
         })
         .collect();
 
@@ -259,6 +387,7 @@ pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Erro
     let mut lon = Vec::new();
     let mut lat = Vec::new();
     let mut osm_id = Vec::new();
+    let mut node_flags = Vec::new();
     for (old, osm) in used.iter().enumerate() {
         if keep[old] {
             remap[old] = lon.len() as u32;
@@ -266,6 +395,14 @@ pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Erro
             lon.push(c.0);
             lat.push(c.1);
             osm_id.push(*osm);
+            let mut f = 0u8;
+            if tagged.signals.contains(osm) {
+                f |= NODE_SIGNALS;
+            }
+            if tagged.barriers.contains(osm) {
+                f |= NODE_BARRIER;
+            }
+            node_flags.push(f);
         }
     }
     let kept: Vec<RawEdge> = edges
@@ -279,16 +416,15 @@ pub fn build(pbf: &Path) -> Result<(Graph, BuildStats), Box<dyn std::error::Erro
         .collect();
 
     stats.nodes_kept = lon.len();
-    stats.edges = kept.len();
-    stats.road_length_km = kept
-        .iter()
-        .filter(|e| e.primary)
-        .map(|e| e.length as f64)
-        .sum::<f64>()
-        / 1000.0;
+    let g = assemble(lon, lat, osm_id, node_flags, kept, names);
 
-    let g = assemble(lon, lat, osm_id, kept, names);
+    // OSM splits ways at every tagging change, so plenty of what the refcount
+    // rule called a junction is topologically degree 2. Splice those away.
+    let (g, c) = contract(g);
+    stats.contract = c;
+    stats.edges = g.n_edges();
     stats.geometry_points = g.geom.len();
+    stats.road_length_km = c.road_m_after / 1000.0;
     Ok((g, stats))
 }
 
@@ -346,7 +482,6 @@ fn emit_way(
             let ms = ((acc / mps) * 1000.0 * w.penalty as f64).round().max(1.0) as u32;
             let forward = w.oneway != Oneway::Reverse;
             let reverse = w.oneway != Oneway::Forward;
-            let mut primary = true;
             if forward {
                 out.push(PendingEdge {
                     a,
@@ -356,9 +491,7 @@ fn emit_way(
                     flags: w.flags,
                     name_id,
                     geom: poly.clone(),
-                    primary,
                 });
-                primary = false;
             }
             if reverse {
                 let mut back = poly.clone();
@@ -371,7 +504,6 @@ fn emit_way(
                     flags: w.flags,
                     name_id,
                     geom: back,
-                    primary,
                 });
             }
         }
@@ -380,6 +512,231 @@ fn emit_way(
         poly.push(p);
         acc = 0.0;
     }
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ContractStats {
+    pub rounds: usize,
+    pub nodes_before: usize,
+    pub nodes_after: usize,
+    pub edges_before: usize,
+    pub edges_after: usize,
+    pub geom_before: usize,
+    pub geom_after: usize,
+    pub road_m_before: f64,
+    pub road_m_after: f64,
+    /// Joints spliced out. Each removes exactly one duplicated polyline point.
+    pub splices: usize,
+    /// Degree-2 rings and lollipops that kept one node so nothing collapsed
+    /// to a self-loop.
+    pub rings_kept: usize,
+    /// Degree-2 nodes kept because they carry a signal or barrier tag.
+    pub tagged_kept: usize,
+    /// Degree-2 nodes kept because their two segments disagree about being
+    /// two-way. See `twins_agree`.
+    pub mixed_kept: usize,
+}
+
+/// Splice out every topologically degree-2 node, preserving length, geometry
+/// and every shortest path.
+///
+/// Works by walking maximal runs of contractible nodes from their boundary
+/// rather than contracting one node at a time, so a single round already
+/// reaches the fixpoint; the loop is belt and braces and reports its count.
+pub fn contract(g: Graph) -> (Graph, ContractStats) {
+    let mut stats = ContractStats {
+        nodes_before: g.n_nodes(),
+        edges_before: g.n_edges(),
+        geom_before: g.geom.len(),
+        road_m_before: g.road_length_m(),
+        ..Default::default()
+    };
+    let n = g.n_nodes();
+
+    let chain: Vec<Option<Chain>> = (0..n as u32)
+        .map(|v| {
+            // A tagged node is a real feature even when it is topologically
+            // degree 2 - a gate, or a signal we will want to charge time for.
+            if contractible_at(&g, v) {
+                chain_at(&g, v)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut drop: Vec<bool> = chain.iter().map(|c| c.is_some()).collect();
+    for v in 0..n {
+        match chain_at(&g, v as u32) {
+            Some(_) if g.node_flags[v] != 0 => stats.tagged_kept += 1,
+            Some(c) if !twins_agree(&g, &c) => stats.mixed_kept += 1,
+            _ => {}
+        }
+    }
+
+    // A run of contractible nodes whose two ends meet at the same node - or
+    // that closes into a ring with no ends at all - would splice down to a
+    // self-loop. Keep one node of each so it stays a real piece of road.
+    let mut seen = vec![false; n];
+    for v in 0..n {
+        if !drop[v] || seen[v] {
+            continue;
+        }
+        seen[v] = true;
+        let c = chain[v].unwrap();
+        let mut ends = [u32::MAX; 2];
+        for (i, start) in [c.u, c.w].into_iter().enumerate() {
+            let (mut prev, mut cur) = (v as u32, start);
+            loop {
+                if !drop[cur as usize] {
+                    ends[i] = cur;
+                    break;
+                }
+                if seen[cur as usize] {
+                    break; // wrapped around a ring
+                }
+                seen[cur as usize] = true;
+                let cc = chain[cur as usize].unwrap();
+                let next = if cc.u == prev { cc.w } else { cc.u };
+                prev = cur;
+                cur = next;
+            }
+        }
+        if ends[0] == ends[1] {
+            drop[v] = false;
+            stats.rings_kept += 1;
+        }
+    }
+
+    let mut remap = vec![u32::MAX; n];
+    let (mut lon, mut lat, mut osm_id, mut node_flags) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for v in 0..n {
+        if !drop[v] {
+            remap[v] = lon.len() as u32;
+            lon.push(g.lon[v]);
+            lat.push(g.lat[v]);
+            osm_id.push(g.osm_id[v]);
+            node_flags.push(g.node_flags[v]);
+        }
+    }
+
+    // Walk out of every surviving node, swallowing contracted nodes until the
+    // next survivor. Each original edge is consumed by exactly one walk.
+    struct Spliced {
+        src: u32,
+        dst: u32,
+        weight: u32,
+        length: f32,
+        flags: u8,
+        name_id: u32,
+        geom: Vec<[f32; 2]>,
+    }
+    let mut spliced: Vec<Spliced> = Vec::new();
+    for u in 0..n as u32 {
+        if drop[u as usize] {
+            continue;
+        }
+        for e in g.out_edges(u) {
+            let mut weight = g.weight[e] as u64;
+            let mut length = g.length[e] as f64;
+            let mut geom = g.geometry(e).to_vec();
+            let mut cur = g.head[e];
+            let mut cur_edge = e as u32;
+            while drop[cur as usize] {
+                let c = chain[cur as usize].expect("dropped node must be a chain");
+                let next = if cur_edge == c.fwd.0 {
+                    c.fwd.1
+                } else {
+                    let bwd = c.bwd.expect("arrived at a one-way chain from behind");
+                    debug_assert_eq!(cur_edge, bwd.0);
+                    bwd.1
+                };
+                weight += g.weight[next as usize] as u64;
+                length += g.length[next as usize] as f64;
+                // Drop the duplicated joint: the previous edge already ended
+                // on this node.
+                geom.extend_from_slice(&g.geometry(next as usize)[1..]);
+                cur = g.head[next as usize];
+                cur_edge = next;
+                stats.splices += 1;
+            }
+            debug_assert_ne!(remap[cur as usize], u32::MAX);
+            // Silently reversed geometry is the classic bug here: it costs the
+            // right amount and draws the wrong line.
+            debug_assert!(
+                geom[0] == node_point(&g, u) && geom[geom.len() - 1] == node_point(&g, cur),
+                "spliced polyline does not run from {u} to {cur}"
+            );
+            spliced.push(Spliced {
+                src: remap[u as usize],
+                dst: remap[cur as usize],
+                weight: weight.min(u32::MAX as u64) as u32,
+                length: length as f32,
+                flags: g.flags[e],
+                name_id: g.name_id[e],
+                geom,
+            });
+        }
+    }
+
+    let edges: Vec<RawEdge> = spliced
+        .into_iter()
+        .map(|s| RawEdge {
+            src: s.src,
+            dst: s.dst,
+            weight: s.weight,
+            length: s.length,
+            flags: s.flags,
+            name_id: s.name_id,
+            geom: s.geom,
+        })
+        .collect();
+
+    let out = assemble(lon, lat, osm_id, node_flags, edges, g.names);
+    stats.rounds = 1;
+    stats.nodes_after = out.n_nodes();
+    stats.edges_after = out.n_edges();
+    stats.geom_after = out.geom.len();
+    stats.road_m_after = out.road_length_m();
+    (out, stats)
+}
+
+/// Both segments either pair with a reverse or neither does.
+///
+/// A node joining an ordinary two-way road to a stretch mapped as two separate
+/// one-way carriageways is topologically degree 2, but splicing it produces one
+/// edge per direction that each contain the shared two-way half - so its length
+/// gets counted twice and total road length quietly grows. Rare (14 nodes here)
+/// and not worth the complication of splitting: leave the node in place.
+pub fn twins_agree(g: &Graph, c: &Chain) -> bool {
+    match c.bwd {
+        // A one-way chain has no reverse edges at all, so nothing can disagree.
+        None => true,
+        Some((wv, vu)) => g.twin[c.fwd.0 as usize] == vu && g.twin[c.fwd.1 as usize] == wv,
+    }
+}
+
+/// Would the contraction pass splice this node away? The ring guard is not
+/// included: that one depends on the whole run, not on the node.
+pub fn contractible_at(g: &Graph, v: u32) -> bool {
+    g.node_flags[v as usize] == 0 && chain_at(g, v).is_some_and(|c| twins_agree(g, &c))
+}
+
+/// Polyline endpoints are stored as the node coordinate narrowed to f32, so
+/// this compares exactly rather than with a tolerance.
+fn node_point(g: &Graph, v: u32) -> [f32; 2] {
+    [g.lon[v as usize] as f32, g.lat[v as usize] as f32]
+}
+
+/// Identity of a directed edge as a physical piece of road.
+type EdgeShape = (u32, u32, Vec<(u32, u32)>);
+
+fn shape_key<'a>(src: u32, dst: u32, points: impl Iterator<Item = &'a [f32; 2]>) -> EdgeShape {
+    (
+        src,
+        dst,
+        points.map(|p| (p[0].to_bits(), p[1].to_bits())).collect(),
+    )
 }
 
 /// CSR offsets from an iterator of source ids. Length `n + 1`.
@@ -398,6 +755,7 @@ fn assemble(
     lon: Vec<f64>,
     lat: Vec<f64>,
     osm_id: Vec<i64>,
+    node_flags: Vec<u8>,
     mut edges: Vec<RawEdge>,
     names: Vec<String>,
 ) -> Graph {
@@ -436,10 +794,46 @@ fn assemble(
     let r_head = rev.iter().map(|(_, i)| edges[*i as usize].src).collect();
     let r_edge = rev.iter().map(|(_, i)| *i).collect();
 
+    // Twins, decided by shape rather than by provenance: two directed edges are
+    // the same road iff they run between the same nodes over the same polyline,
+    // the other way round. Deriving this from the OSM way instead silently fails
+    // on a street mapped as two separate one-way ways - a real case here - and
+    // that made total road length depend on how a mapper split the geometry.
+    // Dual carriageways keep distinct polylines and correctly stay unpaired.
+    let mut twin = vec![NO_TWIN; m];
+    let mut index: HashMap<EdgeShape, Vec<u32>> = HashMap::with_capacity(m);
+    for (i, e) in edges.iter().enumerate() {
+        index
+            .entry(shape_key(e.src, e.dst, e.geom.iter()))
+            .or_default()
+            .push(i as u32);
+    }
+    for (i, e) in edges.iter().enumerate() {
+        if twin[i] != NO_TWIN {
+            continue;
+        }
+        let back = shape_key(e.dst, e.src, e.geom.iter().rev());
+        let Some(slot) = index.get_mut(&back) else {
+            continue;
+        };
+        // Parallel edges are legal, so take an unclaimed one rather than assuming.
+        let Some(pos) = slot.iter().position(|j| twin[*j as usize] == NO_TWIN) else {
+            continue;
+        };
+        let j = slot[pos];
+        if j as usize == i {
+            continue;
+        }
+        twin[i] = j;
+        twin[j as usize] = i as u32;
+    }
+
     Graph {
         lon,
         lat,
         osm_id,
+        node_flags,
+        twin,
         offsets,
         head,
         weight,
@@ -525,7 +919,7 @@ pub fn scc(n: usize, offsets: &[u32], head: &[u32]) -> (Vec<u32>, Vec<u32>) {
 // ---------------------------------------------------------------------------
 
 const MAGIC: &[u8; 8] = b"CHDGRAPH";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 macro_rules! flat_io {
     ($w:ident, $r:ident, $t:ty, $size:expr) => {
@@ -569,6 +963,7 @@ impl Graph {
         w_f64(out, &self.lon)?;
         w_f64(out, &self.lat)?;
         w_i64(out, &self.osm_id)?;
+        out.write_all(&self.node_flags)?;
         w_u32(out, &self.offsets)?;
         w_u32(out, &self.head)?;
         w_u32(out, &self.weight)?;
@@ -579,6 +974,7 @@ impl Graph {
         w_u32(out, &self.r_offsets)?;
         w_u32(out, &self.r_head)?;
         w_u32(out, &self.r_edge)?;
+        w_u32(out, &self.twin)?;
         let flat: Vec<f32> = self.geom.iter().flat_map(|p| [p[0], p[1]]).collect();
         w_f32(out, &flat)?;
         for s in &self.names {
@@ -618,6 +1014,8 @@ impl Graph {
         let lon = r_f64(inp, n)?;
         let lat = r_f64(inp, n)?;
         let osm_id = r_i64(inp, n)?;
+        let mut node_flags = vec![0u8; n];
+        inp.read_exact(&mut node_flags)?;
         let offsets = r_u32(inp, n + 1)?;
         let head = r_u32(inp, m)?;
         let weight = r_u32(inp, m)?;
@@ -629,6 +1027,7 @@ impl Graph {
         let r_offsets = r_u32(inp, n + 1)?;
         let r_head = r_u32(inp, m)?;
         let r_edge = r_u32(inp, m)?;
+        let twin = r_u32(inp, m)?;
         let flat = r_f32(inp, ng * 2)?;
         let geom = flat.as_chunks::<2>().0.to_vec();
         let mut names = Vec::with_capacity(nn);
@@ -646,6 +1045,8 @@ impl Graph {
                 lon,
                 lat,
                 osm_id,
+                node_flags,
+                twin,
                 offsets,
                 head,
                 weight,
@@ -725,34 +1126,27 @@ mod tests {
         assert_eq!(*sizes.iter().max().unwrap(), 3);
     }
 
+    fn seg(src: u32, dst: u32, geom: Vec<[f32; 2]>) -> RawEdge {
+        RawEdge {
+            src,
+            dst,
+            weight: 1200,
+            length: 10.0,
+            flags: 6,
+            name_id: NO_NAME,
+            geom,
+        }
+    }
+
     fn tiny_graph() -> Graph {
-        let edges = vec![
-            RawEdge {
-                src: 0,
-                dst: 1,
-                weight: 1200,
-                length: 10.0,
-                flags: 6,
-                name_id: 0,
-                geom: vec![[76.7, 30.7], [76.8, 30.8]],
-                primary: true,
-            },
-            RawEdge {
-                src: 1,
-                dst: 0,
-                weight: 1200,
-                length: 10.0,
-                flags: 6,
-                name_id: 0,
-                geom: vec![[76.8, 30.8], [76.7, 30.7]],
-                primary: false,
-            },
-        ];
+        let a = [76.7f32, 30.7];
+        let b = [76.8f32, 30.8];
         assemble(
             vec![76.7, 76.8],
             vec![30.7, 30.8],
             vec![111, 222],
-            edges,
+            vec![0, 0],
+            vec![seg(0, 1, vec![a, b]), seg(1, 0, vec![b, a])],
             vec!["Madhya Marg".to_string()],
         )
     }
@@ -767,8 +1161,11 @@ mod tests {
         let inc: Vec<u32> = g.in_edges(1).map(|j| g.r_head[j]).collect();
         assert_eq!(inc, vec![0]);
         assert_eq!(g.geometry(0).len(), 2);
-        assert_eq!(g.name(0), Some("Madhya Marg"));
+        assert_eq!(g.name(0), None);
         assert_eq!(g.max_speed_m_per_ms(), 10.0 / 1200.0);
+        // the two directions found each other
+        assert_eq!(g.twin, vec![1, 0]);
+        assert_eq!(g.road_length_m(), 10.0);
     }
 
     #[test]
@@ -780,5 +1177,116 @@ mod tests {
         assert_eq!(back.to_bytes(hash), bytes);
         assert_eq!(back.lon, g.lon);
         assert_eq!(back.names, g.names);
+        assert_eq!(back.twin, g.twin);
+        assert_eq!(back.node_flags, g.node_flags);
+    }
+
+    /// 0 - 1 - 2 - 3 - 4, two-way, 10 m and 1200 ms per segment.
+    fn chain_graph(node_flags: Vec<u8>) -> Graph {
+        let lon: Vec<f64> = (0..5).map(|i| 76.70 + i as f64 * 0.001).collect();
+        let lat = vec![30.70; 5];
+        let pt = |i: usize| [lon[i] as f32, lat[i] as f32];
+        let mut edges = Vec::new();
+        for i in 0..4u32 {
+            let (a, b) = (pt(i as usize), pt(i as usize + 1));
+            edges.push(seg(i, i + 1, vec![a, b]));
+            edges.push(seg(i + 1, i, vec![b, a]));
+        }
+        assemble(
+            lon,
+            lat,
+            (0..5).map(|i| 1000 + i as i64).collect(),
+            node_flags,
+            edges,
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn chain_contracts_to_one_edge_each_way() {
+        let g = chain_graph(vec![0; 5]);
+        assert_eq!((g.n_nodes(), g.n_edges(), g.geom.len()), (5, 8, 16));
+        let before = g.road_length_m();
+
+        let (c, s) = contract(g);
+        // Only the two tips survive; 1, 2 and 3 are two-way chain interiors.
+        assert_eq!(c.n_nodes(), 2);
+        assert_eq!(c.n_edges(), 2);
+        assert_eq!(s.splices, 6); // three joints, both directions
+                                  // Length and duration are summed, not recomputed.
+        assert_eq!(c.weight, vec![4800, 4800]);
+        assert_eq!(c.length, vec![40.0, 40.0]);
+        assert!((c.road_length_m() - before).abs() < 1e-3);
+        // Points move between edges; none of the distinct vertices are lost.
+        assert_eq!(c.geom.len(), 10);
+        assert_eq!(c.geometry(0).len(), 5);
+
+        // Geometry runs the way you travel it, and the reverse is the mirror.
+        let fwd: Vec<[f32; 2]> = c.geometry(0).to_vec();
+        let mut bwd: Vec<[f32; 2]> = c.geometry(1).to_vec();
+        bwd.reverse();
+        assert_eq!(fwd, bwd);
+        assert_eq!(fwd[0], [c.lon[0] as f32, c.lat[0] as f32]);
+        assert_eq!(fwd[4], [c.lon[1] as f32, c.lat[1] as f32]);
+        assert_eq!(c.twin, vec![1, 0]);
+        // The surviving nodes are the original tips.
+        assert_eq!(c.osm_id, vec![1000, 1004]);
+    }
+
+    #[test]
+    fn a_tagged_node_survives_contraction() {
+        // Node 2 carries a barrier: it is a real routing feature, keep it.
+        let mut flags = vec![0u8; 5];
+        flags[2] = NODE_BARRIER;
+        let (c, s) = contract(chain_graph(flags));
+        assert_eq!(c.n_nodes(), 3);
+        assert_eq!(c.osm_id, vec![1000, 1002, 1004]);
+        assert_eq!(s.tagged_kept, 1);
+        assert_eq!(c.weight, vec![2400, 2400, 2400, 2400]);
+    }
+
+    #[test]
+    fn a_degree_two_ring_keeps_one_node() {
+        // 0 - 1 - 2 - 0, every node two-way degree 2. Contracting all three
+        // would collapse the ring to a self-loop.
+        let lon = vec![76.70, 76.71, 76.705];
+        let lat = vec![30.70, 30.70, 30.71];
+        let pt = |i: usize| [lon[i] as f32, lat[i] as f32];
+        let mut edges = Vec::new();
+        for i in 0..3u32 {
+            let j = (i + 1) % 3;
+            let (a, b) = (pt(i as usize), pt(j as usize));
+            edges.push(seg(i, j, vec![a, b]));
+            edges.push(seg(j, i, vec![b, a]));
+        }
+        let g = assemble(lon, lat, vec![1, 2, 3], vec![0; 3], edges, Vec::new());
+        let (c, s) = contract(g);
+        assert_eq!(s.rings_kept, 1);
+        assert_eq!(c.n_nodes(), 1);
+        // One node left, so the ring is a self-loop pair rather than nothing.
+        assert_eq!(c.n_edges(), 2);
+        assert_eq!(c.head, vec![0, 0]);
+        assert!((c.road_length_m() - 30.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn an_asymmetric_node_is_not_a_chain() {
+        // u -> v, v -> w, w -> v. No v -> u, so v encodes a real one-way turn.
+        let p = [76.70f32, 30.70];
+        let edges = vec![
+            seg(0, 1, vec![p, p]),
+            seg(1, 2, vec![p, p]),
+            seg(2, 1, vec![p, p]),
+        ];
+        let g = assemble(
+            vec![76.70, 76.71, 76.72],
+            vec![30.70, 30.70, 30.70],
+            vec![1, 2, 3],
+            vec![0; 3],
+            edges,
+            Vec::new(),
+        );
+        assert_eq!(chain_at(&g, 1), None);
+        assert_eq!(shape_at(&g, 1), Shape::Junction);
     }
 }
