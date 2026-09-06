@@ -30,6 +30,11 @@ pub const NO_NAME: u32 = u32::MAX;
 /// Sentinel in `twin` for a one-way edge with no opposite direction.
 pub const NO_TWIN: u32 = u32::MAX;
 
+/// Set on the reverse direction of a two-way road: it shares its twin's
+/// geometry span and walks it backwards. Sits above the class bits that
+/// `osm-parse` owns.
+pub const FLAG_GEOM_REVERSED: u8 = 0x40;
+
 /// `node_flags` bits.
 pub const NODE_SIGNALS: u8 = 0x01;
 pub const NODE_BARRIER: u8 = 0x02;
@@ -52,8 +57,10 @@ pub struct Graph {
     pub weight: Vec<u32>,
     /// Length in metres, summed along the polyline.
     pub length: Vec<f32>,
-    /// Length `n_edges + 1`, indexes into `geom`.
-    pub geom_off: Vec<u32>,
+    /// Start of this edge's polyline in `geom`. Two directions of one road
+    /// share a span, so this is a start/len pair rather than a prefix array.
+    pub geom_start: Vec<u32>,
+    pub geom_len: Vec<u32>,
     pub flags: Vec<u8>,
     pub name_id: Vec<u32>,
 
@@ -71,9 +78,16 @@ pub struct Graph {
     /// geometry arena will share a span on.
     pub twin: Vec<u32>,
 
-    /// Flat `(lon, lat)` polyline points, both endpoints included.
+    /// Flat `(lon, lat)` polyline points, both endpoints included. Stored once
+    /// per road, forward-oriented.
     pub geom: Vec<[f32; 2]>,
     pub names: Vec<String>,
+
+    /// Fastest edge in the graph, metres per millisecond, fixed at build time
+    /// and carried in the file header. A* divides by this, so it must be the
+    /// value the weights were actually built with rather than something
+    /// recomputed on a load path that could later drift.
+    pub max_speed_m_per_ms: f64,
 }
 
 impl Graph {
@@ -91,8 +105,14 @@ impl Graph {
     pub fn in_edges(&self, v: u32) -> std::ops::Range<usize> {
         self.r_offsets[v as usize] as usize..self.r_offsets[v as usize + 1] as usize
     }
-    pub fn geometry(&self, edge: usize) -> &[[f32; 2]] {
-        &self.geom[self.geom_off[edge] as usize..self.geom_off[edge + 1] as usize]
+    /// The edge's polyline in travel order.
+    pub fn geometry(&self, edge: usize) -> Polyline<'_> {
+        let start = self.geom_start[edge] as usize;
+        Polyline {
+            span: &self.geom[start..start + self.geom_len[edge] as usize],
+            reversed: self.flags[edge] & FLAG_GEOM_REVERSED != 0,
+            next: 0,
+        }
     }
     pub fn name(&self, edge: usize) -> Option<&str> {
         match self.name_id[edge] {
@@ -111,6 +131,16 @@ impl Graph {
             t => (edge as u32).min(t),
         }
     }
+    /// Polyline segments (point pairs) across distinct roads. Splicing joins
+    /// polylines end to end without adding or removing a segment, so this is
+    /// exactly invariant under contraction - unlike the raw point count, which
+    /// drops by one per joint because the joint was stored twice.
+    pub fn geom_segments(&self) -> usize {
+        (0..self.n_edges())
+            .filter(|e| self.flags[*e] & FLAG_GEOM_REVERSED == 0)
+            .map(|e| self.geom_len[e] as usize - 1)
+            .sum()
+    }
     /// Road length in metres, counting a two-way segment once.
     pub fn road_length_m(&self) -> f64 {
         (0..self.n_edges())
@@ -118,17 +148,34 @@ impl Graph {
             .map(|e| self.length[e] as f64)
             .sum()
     }
-    /// Fastest edge in the graph, in metres per millisecond. This is the value
-    /// an admissible A* heuristic must divide by - the *maximum* speed, never
-    /// the average.
-    pub fn max_speed_m_per_ms(&self) -> f64 {
-        self.length
-            .iter()
-            .zip(&self.weight)
-            .map(|(l, w)| *l as f64 / *w as f64)
-            .fold(0.0, f64::max)
+}
+
+/// An edge's points in travel order. The reverse direction of a two-way road
+/// shares its twin's span and yields it backwards, so this cannot be a slice.
+pub struct Polyline<'a> {
+    span: &'a [[f32; 2]],
+    reversed: bool,
+    next: usize,
+}
+
+impl Iterator for Polyline<'_> {
+    type Item = [f32; 2];
+    fn next(&mut self) -> Option<[f32; 2]> {
+        let p = self.span.get(if self.reversed {
+            self.span.len().checked_sub(self.next + 1)?
+        } else {
+            self.next
+        })?;
+        self.next += 1;
+        Some(*p)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.span.len() - self.next;
+        (n, Some(n))
     }
 }
+
+impl ExactSizeIterator for Polyline<'_> {}
 
 // ---------------------------------------------------------------------------
 // topology
@@ -523,6 +570,8 @@ pub struct ContractStats {
     pub edges_after: usize,
     pub geom_before: usize,
     pub geom_after: usize,
+    pub segments_before: usize,
+    pub segments_after: usize,
     pub road_m_before: f64,
     pub road_m_after: f64,
     /// Joints spliced out. Each removes exactly one duplicated polyline point.
@@ -548,6 +597,7 @@ pub fn contract(g: Graph) -> (Graph, ContractStats) {
         nodes_before: g.n_nodes(),
         edges_before: g.n_edges(),
         geom_before: g.geom.len(),
+        segments_before: g.geom_segments(),
         road_m_before: g.road_length_m(),
         ..Default::default()
     };
@@ -639,7 +689,7 @@ pub fn contract(g: Graph) -> (Graph, ContractStats) {
         for e in g.out_edges(u) {
             let mut weight = g.weight[e] as u64;
             let mut length = g.length[e] as f64;
-            let mut geom = g.geometry(e).to_vec();
+            let mut geom: Vec<[f32; 2]> = g.geometry(e).collect();
             let mut cur = g.head[e];
             let mut cur_edge = e as u32;
             while drop[cur as usize] {
@@ -655,7 +705,7 @@ pub fn contract(g: Graph) -> (Graph, ContractStats) {
                 length += g.length[next as usize] as f64;
                 // Drop the duplicated joint: the previous edge already ended
                 // on this node.
-                geom.extend_from_slice(&g.geometry(next as usize)[1..]);
+                geom.extend(g.geometry(next as usize).skip(1));
                 cur = g.head[next as usize];
                 cur_edge = next;
                 stats.splices += 1;
@@ -663,7 +713,10 @@ pub fn contract(g: Graph) -> (Graph, ContractStats) {
             debug_assert_ne!(remap[cur as usize], u32::MAX);
             // Silently reversed geometry is the classic bug here: it costs the
             // right amount and draws the wrong line.
-            debug_assert!(
+            // One comparison per edge, kept in release: silently reversed
+            // geometry costs the right amount and draws the wrong line, and a
+            // debug_assert here would never run in the build that matters.
+            assert!(
                 geom[0] == node_point(&g, u) && geom[geom.len() - 1] == node_point(&g, cur),
                 "spliced polyline does not run from {u} to {cur}"
             );
@@ -697,6 +750,7 @@ pub fn contract(g: Graph) -> (Graph, ContractStats) {
     stats.nodes_after = out.n_nodes();
     stats.edges_after = out.n_edges();
     stats.geom_after = out.geom.len();
+    stats.segments_after = out.geom_segments();
     stats.road_m_after = out.road_length_m();
     (out, stats)
 }
@@ -770,18 +824,13 @@ fn assemble(
     let mut length = Vec::with_capacity(m);
     let mut flags = Vec::with_capacity(m);
     let mut name_id = Vec::with_capacity(m);
-    let mut geom_off = Vec::with_capacity(m + 1);
-    let mut geom = Vec::new();
     for e in &edges {
         head.push(e.dst);
         weight.push(e.weight);
         length.push(e.length);
-        flags.push(e.flags);
+        flags.push(e.flags & !FLAG_GEOM_REVERSED);
         name_id.push(e.name_id);
-        geom_off.push(geom.len() as u32);
-        geom.extend_from_slice(&e.geom);
     }
-    geom_off.push(geom.len() as u32);
 
     // Reverse CSR: bucket every edge by its target.
     let mut rev: Vec<(u32, u32)> = edges
@@ -828,6 +877,38 @@ fn assemble(
         twin[j as usize] = i as u32;
     }
 
+    // Store each road's polyline once, forward-oriented, and point the reverse
+    // direction at the same span with an invert-on-read flag. Phase 5 roughly
+    // doubles the edge count with shortcuts and the geometry arena should not
+    // follow.
+    let mut geom_start = vec![0u32; m];
+    let mut geom_len = vec![0u32; m];
+    let mut geom: Vec<[f32; 2]> = Vec::new();
+    for (i, e) in edges.iter().enumerate() {
+        let t = twin[i];
+        if t != NO_TWIN && (t as usize) < i {
+            // The twin already wrote the span; walk it the other way.
+            geom_start[i] = geom_start[t as usize];
+            geom_len[i] = geom_len[t as usize];
+            flags[i] |= FLAG_GEOM_REVERSED;
+            continue;
+        }
+        geom_start[i] = geom.len() as u32;
+        geom_len[i] = e.geom.len() as u32;
+        geom.extend_from_slice(&e.geom);
+    }
+
+    let max_speed_m_per_ms = edges
+        .iter()
+        .map(|e| e.length as f64 / e.weight as f64)
+        .fold(0.0, f64::max);
+    debug_assert!(
+        edges
+            .iter()
+            .all(|e| e.length as f64 / e.weight as f64 <= max_speed_m_per_ms),
+        "an edge is faster than the recorded maximum, which makes A* inadmissible"
+    );
+
     Graph {
         lon,
         lat,
@@ -838,7 +919,8 @@ fn assemble(
         head,
         weight,
         length,
-        geom_off,
+        geom_start,
+        geom_len,
         flags,
         name_id,
         r_offsets,
@@ -846,6 +928,7 @@ fn assemble(
         r_edge,
         geom,
         names,
+        max_speed_m_per_ms,
     }
 }
 
@@ -919,7 +1002,7 @@ pub fn scc(n: usize, offsets: &[u32], head: &[u32]) -> (Vec<u32>, Vec<u32>) {
 // ---------------------------------------------------------------------------
 
 const MAGIC: &[u8; 8] = b"CHDGRAPH";
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 macro_rules! flat_io {
     ($w:ident, $r:ident, $t:ty, $size:expr) => {
@@ -951,6 +1034,7 @@ impl Graph {
         out.write_all(MAGIC)?;
         w_u32(out, &[FORMAT_VERSION])?;
         out.write_all(&source_hash.to_le_bytes())?;
+        w_f64(out, &[self.max_speed_m_per_ms])?;
         w_u32(
             out,
             &[
@@ -968,7 +1052,8 @@ impl Graph {
         w_u32(out, &self.head)?;
         w_u32(out, &self.weight)?;
         w_f32(out, &self.length)?;
-        w_u32(out, &self.geom_off)?;
+        w_u32(out, &self.geom_start)?;
+        w_u32(out, &self.geom_len)?;
         out.write_all(&self.flags)?;
         w_u32(out, &self.name_id)?;
         w_u32(out, &self.r_offsets)?;
@@ -1003,6 +1088,7 @@ impl Graph {
         let mut hash = [0u8; 8];
         inp.read_exact(&mut hash)?;
         let source_hash = u64::from_le_bytes(hash);
+        let max_speed_m_per_ms = r_f64(inp, 1)?[0];
         let counts = r_u32(inp, 4)?;
         let (n, m, ng, nn) = (
             counts[0] as usize,
@@ -1020,7 +1106,8 @@ impl Graph {
         let head = r_u32(inp, m)?;
         let weight = r_u32(inp, m)?;
         let length = r_f32(inp, m)?;
-        let geom_off = r_u32(inp, m + 1)?;
+        let geom_start = r_u32(inp, m)?;
+        let geom_len = r_u32(inp, m)?;
         let mut flags = vec![0u8; m];
         inp.read_exact(&mut flags)?;
         let name_id = r_u32(inp, m)?;
@@ -1040,6 +1127,19 @@ impl Graph {
             );
         }
 
+        // The header value is what A* divides by. If it no longer bounds every
+        // edge the heuristic is inadmissible and routes go quietly non-optimal.
+        if let Some(e) = (0..m).find(|e| length[*e] as f64 / weight[*e] as f64 > max_speed_m_per_ms)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "edge {e} runs at {:.3} m/ms, above the header maximum {max_speed_m_per_ms:.3}",
+                    length[e] as f64 / weight[e] as f64
+                ),
+            ));
+        }
+
         Ok((
             Graph {
                 lon,
@@ -1051,7 +1151,8 @@ impl Graph {
                 head,
                 weight,
                 length,
-                geom_off,
+                geom_start,
+                geom_len,
                 flags,
                 name_id,
                 r_offsets,
@@ -1059,6 +1160,7 @@ impl Graph {
                 r_edge,
                 geom,
                 names,
+                max_speed_m_per_ms,
             },
             source_hash,
         ))
@@ -1161,8 +1263,15 @@ mod tests {
         let inc: Vec<u32> = g.in_edges(1).map(|j| g.r_head[j]).collect();
         assert_eq!(inc, vec![0]);
         assert_eq!(g.geometry(0).len(), 2);
+        // one road, one span: the reverse direction reads it backwards
+        assert_eq!(g.geom.len(), 2);
+        assert_eq!(g.flags[1] & FLAG_GEOM_REVERSED, FLAG_GEOM_REVERSED);
+        let f: Vec<[f32; 2]> = g.geometry(0).collect();
+        let mut b: Vec<[f32; 2]> = g.geometry(1).collect();
+        b.reverse();
+        assert_eq!(f, b);
         assert_eq!(g.name(0), None);
-        assert_eq!(g.max_speed_m_per_ms(), 10.0 / 1200.0);
+        assert_eq!(g.max_speed_m_per_ms, 10.0 / 1200.0);
         // the two directions found each other
         assert_eq!(g.twin, vec![1, 0]);
         assert_eq!(g.road_length_m(), 10.0);
@@ -1205,7 +1314,7 @@ mod tests {
     #[test]
     fn chain_contracts_to_one_edge_each_way() {
         let g = chain_graph(vec![0; 5]);
-        assert_eq!((g.n_nodes(), g.n_edges(), g.geom.len()), (5, 8, 16));
+        assert_eq!((g.n_nodes(), g.n_edges(), g.geom.len()), (5, 8, 8));
         let before = g.road_length_m();
 
         let (c, s) = contract(g);
@@ -1217,13 +1326,13 @@ mod tests {
         assert_eq!(c.weight, vec![4800, 4800]);
         assert_eq!(c.length, vec![40.0, 40.0]);
         assert!((c.road_length_m() - before).abs() < 1e-3);
-        // Points move between edges; none of the distinct vertices are lost.
-        assert_eq!(c.geom.len(), 10);
+        // One span for the road, read forwards and backwards.
+        assert_eq!(c.geom.len(), 5);
         assert_eq!(c.geometry(0).len(), 5);
 
         // Geometry runs the way you travel it, and the reverse is the mirror.
-        let fwd: Vec<[f32; 2]> = c.geometry(0).to_vec();
-        let mut bwd: Vec<[f32; 2]> = c.geometry(1).to_vec();
+        let fwd: Vec<[f32; 2]> = c.geometry(0).collect();
+        let mut bwd: Vec<[f32; 2]> = c.geometry(1).collect();
         bwd.reverse();
         assert_eq!(fwd, bwd);
         assert_eq!(fwd[0], [c.lon[0] as f32, c.lat[0] as f32]);

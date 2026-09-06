@@ -57,7 +57,12 @@ fn build(pbf: &Path, out: &Path) -> Result<(), Box<dyn std::error::Error>> {
         assert!(!g.in_edges(v).is_empty(), "node {v} has in-degree 0");
     }
     assert_eq!(*g.offsets.last().unwrap() as usize, g.n_edges());
-    assert_eq!(*g.geom_off.last().unwrap() as usize, g.geom.len());
+    // Spans are shared between the two directions of a road, so the arena is
+    // covered rather than exactly tiled: check every span lands inside it.
+    assert!(
+        (0..g.n_edges()).all(|e| (g.geom_start[e] + g.geom_len[e]) as usize <= g.geom.len()),
+        "an edge geometry span runs past the end of the arena"
+    );
 
     // --- contraction gate --------------------------------------------------
     let c = s.contract;
@@ -66,12 +71,13 @@ fn build(pbf: &Path, out: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "contraction moved total road length by {:.3} m",
         c.road_m_after - c.road_m_before
     );
-    // Each splice removes exactly one duplicated joint point and no distinct
-    // vertex, so the arithmetic is exact rather than "roughly unchanged".
+    // Points move between edges and joints stop being stored twice, so the raw
+    // point count legitimately falls. What cannot change is the number of
+    // polyline segments: splicing joins two polylines without drawing or
+    // erasing a line.
     assert_eq!(
-        c.geom_after,
-        c.geom_before - c.splices,
-        "geometry points did not just move between edges"
+        c.segments_after, c.segments_before,
+        "contraction added or lost polyline segments"
     );
     // Connectivity is not a function of contraction: it was one SCC before.
     let (_, sizes) = graph::scc(g.n_nodes(), &g.offsets, &g.head);
@@ -148,9 +154,10 @@ fn build(pbf: &Path, out: &Path) -> Result<(), Box<dyn std::error::Error>> {
         c.splices
     );
     println!(
-        "                  geometry {} -> {} points, road {:.3} -> {:.3} km",
+        "                  geometry {} -> {} points ({} segments), road {:.3} -> {:.3} km",
         c.geom_before,
         c.geom_after,
+        c.segments_after,
         c.road_m_before / 1000.0,
         c.road_m_after / 1000.0
     );
@@ -165,7 +172,7 @@ fn build(pbf: &Path, out: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("missing coords    {}", s.missing_coords);
     println!(
         "max edge speed    {:.1} km/h",
-        g.max_speed_m_per_ms() * 3600.0
+        g.max_speed_m_per_ms * 3600.0
     );
     println!();
     println!(

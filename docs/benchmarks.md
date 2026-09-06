@@ -71,19 +71,21 @@ reporting 0 still-contractible nodes afterwards):
 | Nodes | 43,097 | 40,572 | -2,525 (-5.86%) |
 | Directed edges | 108,140 | 103,658 | -4,482 (-4.14%) |
 | Mean out-degree | 2.509 | 2.555 | +0.046 |
-| Geometry points | 337,090 | 332,608 | -4,482 |
+| Geometry points | 183,092 | 180,567 | -2,525 |
+| Polyline segments | 124,668 | 124,668 | 0 |
 | Total road length | 4,557.524 km | 4,557.524 km | 0 |
-| `graph.bin` | 7,213,681 B | 7,422,251 B | +2.9% |
 | Fastest edge | 70.1 km/h | 70.0 km/h | - |
 
 Gates, all asserted inside `graph build`:
 
 - Total road length unchanged (tolerance 1 m, actual drift below f32 noise).
-- Geometry points are exactly `before - splices`. **Deviation from the stated
-  gate**, which asked for an unchanged count: each splice removes one *duplicated*
-  joint point, since the incoming edge already ended on the node the outgoing edge
-  starts from. No distinct vertex is lost, which is what the unchanged road length
-  confirms independently. 4,482 splices, 4,482 points removed.
+- **Polyline segment count unchanged.** *Deviation from the stated gate*, which
+  asked for an unchanged geometry *point* count. Points legitimately fall: each
+  splice removes a joint that was stored twice, once as the end of the incoming
+  polyline and once as the start of the outgoing one. The invariant that does hold
+  exactly is the number of polyline segments - splicing joins two lines without
+  drawing or erasing one - so that is what the gate asserts. Unchanged road length
+  confirms it independently.
 - The contracted graph is still a single SCC covering all its nodes.
 - Round-trips byte-identically; every node keeps in- and out-degree >= 1.
 
@@ -91,9 +93,38 @@ Nodes deliberately left uncontracted: 411 carrying `highway=traffic_signals` or
 `barrier=*`, 16 whose two segments disagree about being two-way, 7 holding a
 degree-2 ring open.
 
-`graph.bin` grew 2.9% despite having fewer nodes and edges: format v2 adds the
-per-node `node_flags` byte and the per-edge `twin` u32, and the `twin` array
-alone is 4 bytes on every one of 103,658 edges.
+## Phase 1c - two audits
+
+**Geometry sharing.** An edge and its reverse each stored their own copy of the
+polyline. Measured before fixing: 47,759 two-way pairs holding 152,041 duplicated
+points, 46% of a 332,608-point arena. Every pair was an exact mirror, which is a
+useful confirmation that the structural twin rule is right. Each road now stores
+one forward-oriented span and the reverse direction reads it backwards via a
+`FLAG_GEOM_REVERSED` bit. Phase 5 roughly doubles the edge count with shortcuts;
+the arena no longer follows.
+
+**`max_speed` in the header.** Was recomputed from the edge arrays at load. Now
+fixed at build time and serialised, so the value A\* divides by is provably the
+one the weights were built with. `Graph::read_from` rejects a file whose header
+maximum does not bound every edge - that check is at load rather than in the build
+loop, where it would be tautological, and it is what would fire the first time
+anyone adds a speed boost and makes A\* inadmissible.
+
+| `graph.bin` | Bytes | vs v1 |
+|---|---|---|
+| v1 (pre-contraction, duplicated geometry) | 7,213,681 | - |
+| v2 (contracted, `node_flags` + `twin`) | 7,422,251 | +2.9% |
+| v3 (shared geometry, header `max_speed`) | 6,620,559 | -8.2% |
+
+### A second bug this surfaced
+
+Contraction copied each source edge's flag byte onto the spliced edge, including
+`FLAG_GEOM_REVERSED` - a storage detail of one particular arena, not a property of
+the road. Spliced edges inheriting it had their polylines read backwards. The
+existing orientation guard did not catch it because it was a `debug_assert!` and
+the build that matters runs `--release`. It is now a plain `assert!`: one
+comparison per edge, and the class of bug it catches draws the wrong line on the
+map while costing exactly the right amount.
 
 ### A bug this surfaced
 
@@ -131,5 +162,5 @@ timestamps allow per-class speeds to be derived from real driving rather than
 tuned against intuition.
 
 The fastest edge is 70.0 km/h, above every class default because a handful of
-ways carry an explicit `maxspeed`. Phase 2's A\* heuristic must divide by this
-measured maximum, never by an assumed or average one.
+ways carry an explicit `maxspeed`. It is carried in the `graph.bin` header, and
+Phase 2's A\* heuristic divides by that stored value.
