@@ -1,4 +1,5 @@
-data/raw/
+data/raw/*
+!data/raw/PROVENANCE
 data/build/
 target/
 node_modules/

@@ -1,0 +1,29 @@
+# PROVENANCE - regenerate with: make data
+generated_utc:   2026-09-06T07:33:28Z
+source_url:      https://download.geofabrik.de/asia/india-latest.osm.pbf
+source_md5:      381ad981eb5be9402ab86024eeb05054
+source_bytes:    1706252573
+coarse_bbox:     75.5,30.0,78.0,31.5   (osmconvert -b)
+clip_bbox:       76.65,30.65,76.87,30.80   (tools/clip.py, complete_ways)
+relations:       dropped - Phase 8 turn restrictions will need a re-clip
+extract_bytes:   2754868
+extract_md5:     cf79ccf388702568cc46a12108b0774d
+
+# osmconvert --out-statistics data/raw/chandigarh.osm.pbf
+timestamp min: 2009-02-18T22:48:32Z
+timestamp max: 2026-09-05T13:47:16Z
+lon min: 75.5154070
+lon max: 77.2643702
+lat min: 30.1807552
+lat max: 31.2698694
+nodes: 316793
+ways: 72702
+relations: 0
+node id min: 125904109
+node id max: 14155397601
+way id min: 28297304
+way id max: 1551761526
+keyval pairs max: 33
+keyval pairs max object: node 342117043
+noderefs max: 1363
+noderefs max object: way 323889771
