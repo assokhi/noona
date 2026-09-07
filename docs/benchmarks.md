@@ -287,6 +287,107 @@ which is the part of "does this look sane" that can be checked without a map.
   straight line is expected here rather than suspicious. The route name overstates
   what it tests.
 
+## Phase 3 - snapping, coordinate routing, HTTP
+
+### Nearest-edge snapping
+
+Uniform grid over edges, 200 m cells converted to degrees at the graph's own
+latitude. Only the canonical direction of each road is indexed, since twins
+share a polyline and are exactly equidistant from any point.
+
+| Metric | Value |
+|---|---|
+| Grid | 128 x 106 cells, 88,725 entries |
+| Build time | 16 ms at load |
+| Query mean / p50 / p99 | 0.0129 / 0.0096 / 0.0581 ms |
+| Brute-force scan mean | 3.381 ms |
+| Speedup over brute force | **262x** |
+| Agreement with brute force | 1000 / 1000, exact edge id, distance to 1e-6 |
+
+The five adversarial cases behave:
+
+| Case | Result |
+|---|---|
+| Middle of Sukhna Lake | 421.6 m to Sarovar Path - far, and says so |
+| Capitol Complex open space | 15.6 m |
+| Sector 17/22 roundabout | 6.4 m |
+| Exactly on a node | 0.1 m |
+| Outside the bbox | `NO_ROAD_WITHIN_RADIUS`, not a road 40 km away |
+
+Snapping onto a node returns 0.1 m rather than 0. Geometry is f32, whose ulp
+near longitude 76.7 is about 0.73 m, so that is the floor on snap precision -
+two orders of magnitude below GPS accuracy. Offsets within 1 m of an edge end
+are clamped onto it, or a point exactly on a junction would invent a sub-metre
+partial edge and shift a route cost by a millisecond.
+
+### Coordinate routing
+
+Endpoints become seed costs on an ordinary search; nothing is inserted into the
+graph. 1000 node-coordinate pairs x 3 algorithms match their node routes
+**exactly**.
+
+Coordinate routing costs +6% over node routing in-process (bidirectional p50
+2.067 ms against 1.953 ms on the same run), which is the snapping, the two
+extra seeds, and assembling the partial leg geometry.
+
+### HTTP API
+
+Same 1000 OD pairs over HTTP. All three algorithms agree on every pair, and
+mean nodes settled matches the in-process harness **exactly** - 21,103 /
+11,017 / 12,026 - which is the check that the API is running the same search
+and not a subtly different one.
+
+| Geometry | Concurrency | p50 (ms) | p95 (ms) | p99 (ms) | Body | req/s |
+|---|---|---|---|---|---|---|
+| GeoJSON | 1 | 1.629 | 3.479 | 4.644 | 6.0 KB | 561 |
+| Polyline | 1 | 1.677 | 4.073 | 5.811 | 1.2 KB | 521 |
+| GeoJSON | 16 | 3.870 | 7.441 | 10.389 | 6.0 KB | 3,726 |
+| Polyline | 16 | 3.617 | 7.200 | 10.420 | 1.2 KB | 3,898 |
+
+**The 20% gate is not met: API p50 at concurrency 1 is 1.629 ms against an
+in-process coordinate baseline of about 1.20 ms, so +36%.** Where it goes, and
+what it is not:
+
+- **Not serialisation.** A 1.2 KB polyline body costs the same p50 as a 6.0 KB
+  GeoJSON body. Shrinking the response by 5x changes nothing, so the cost is
+  per-request, not per-byte.
+- **Not the pool.** Pool wait is under 1 ms for 5,069 of 5,111 requests and
+  essentially zero at p50.
+- **Not snapping.** Two snaps cost 0.04 ms together.
+- It is HTTP framing, syscalls, and the client. The server's own view of a
+  request is search-plus-geometry at 1.116 ms p50 with snapping at 0.020 ms.
+
+One caveat on how this was measured, which matters more than the number. Client
+and server share one laptop, so the benchmark competes with the thing it is
+measuring. Run immediately after a 1000-pair in-process bench, the same API
+measures +118% to +162%; on an otherwise idle machine it measures +36%. The
+figure above is the idle one. This is the same lesson as the Phase 2
+interleaving fix: on this hardware, wall-clock comparisons need the measurement
+protocol pinned down before the number means anything.
+
+Searches run inline on the async worker rather than through `spawn_blocking`.
+The handoff measured at roughly 0.5 ms against a search of about 1.3 ms, and
+the pool already bounds how many workers can be busy. Measured: 2.549 ms vs
+3.091 ms p50 at concurrency 1, identical throughput at 16.
+
+### Basemap
+
+| Artefact | Size |
+|---|---|
+| `chandigarh.pmtiles` (basemap, z0-15) | 4,490,370 B |
+| `graph.bin` (routing graph) | 6,620,559 B |
+
+Worth sitting with: **every road, building, water body and label needed to draw
+this city is smaller than the routing graph for the same area.** The basemap is
+tuned for drawing and throws away everything else; the graph keeps a reverse
+index, twin links, per-edge weights and a geometry arena because routing needs
+to traverse, not just paint. Extraction pulled 4.7 MB over 41 HTTP range
+requests from a 138 GB global archive that was never downloaded.
+
+Range requests are verified rather than assumed: `curl -H 'Range: bytes=0-99'`
+returns `206 Partial Content` with `Content-Range: bytes 0-99/4490370`. A server
+that ignores `Range` appears to work while fetching the whole archive per tile.
+
 ## Finding: `maxspeed` coverage is 0.4%
 
 106 of 25,457 kept ways carry a `maxspeed` tag, and 0 of those were unparseable.

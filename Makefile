@@ -1,4 +1,4 @@
-.PHONY: data graph stats bench snap coord serve apibench test fmt lint fixture assert ci
+.PHONY: data graph stats bench snap coord serve apibench tiles web test fmt lint fixture assert ci
 CARGO ?= cargo
 
 ## Regenerate the Chandigarh extract. Local only - downloads 1.6 GB.
@@ -17,6 +17,10 @@ coord: ; @$(CARGO) run -p bench --release -- coord --pairs data/build/od.json
 serve: ; @$(CARGO) run -p api --release -- --addr 127.0.0.1:8080 --pool 16
 ## Same OD pairs over HTTP, at concurrency 1 and 16. Needs `make serve` running.
 apibench: ; @python tools/http_bench.py
+## Extract the basemap from the Protomaps global build. Local only.
+tiles: ; @bash tools/tiles.sh
+## Run the map UI. Needs `make serve` in another shell.
+web: ; @cd web && npm install --silent && npm run dev
 test: ; @$(CARGO) test --workspace
 fmt: ; @$(CARGO) fmt --all --check
 lint: ; @$(CARGO) clippy --workspace --all-targets -- -D warnings

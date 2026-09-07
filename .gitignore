@@ -4,4 +4,7 @@ data/build/*
 !data/build/od.json
 target/
 node_modules/
+web/dist/
+# 4.5 MB, regenerate with `make tiles`
+web/public/*.pmtiles
 tools/bin/

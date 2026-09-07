@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <title>Chandigarh routing</title>
+    <style>
+      :root {
+        --panel: #11161d;
+        --line: #232b36;
+        --text: #e6ebf2;
+        --dim: #8b97a8;
+        --accent: #3ddc97;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: var(--text);
+        background: #0b0e12;
+      }
+      #map { position: absolute; inset: 0; }
+      #panel {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        width: 268px;
+        max-height: calc(100% - 24px);
+        overflow: auto;
+        background: color-mix(in srgb, var(--panel) 92%, transparent);
+        backdrop-filter: blur(8px);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 12px;
+        z-index: 2;
+      }
+      h1 { font-size: 13px; margin: 0 0 8px; letter-spacing: 0.02em; }
+      h2 {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--dim);
+        margin: 14px 0 6px;
+        font-weight: 600;
+      }
+      .row { display: flex; gap: 6px; flex-wrap: wrap; }
+      button {
+        font: inherit;
+        color: var(--text);
+        background: #1a212b;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 5px 9px;
+        cursor: pointer;
+      }
+      button:hover { border-color: #38424f; }
+      button.on { background: var(--accent); color: #06120c; border-color: var(--accent); font-weight: 600; }
+      #status { margin-top: 10px; color: var(--dim); font-size: 12px; }
+      #status.bad { color: #ff8080; }
+      #debug > div {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 2px 0;
+        border-bottom: 1px dotted #1c232c;
+      }
+      #debug span { color: var(--dim); }
+      #debug b { font-variant-numeric: tabular-nums; font-weight: 600; }
+      #debug .dim { color: var(--dim); border: 0; }
+      #speed { color: var(--dim); font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+      @media (max-width: 560px) {
+        #panel { width: auto; right: 12px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div id="panel">
+      <h1>Chandigarh routing</h1>
+      <div class="row">
+        <button data-alg="dijkstra">dijkstra</button>
+        <button data-alg="astar">A*</button>
+        <button data-alg="bidir" class="on">bidir</button>
+      </div>
+      <div class="row" style="margin-top: 6px">
+        <button id="clear">clear</button>
+        <button id="locate">track me</button>
+        <button id="raw">raw fix</button>
+      </div>
+      <div id="status">loading…</div>
+      <div id="speed"></div>
+      <h2>debug</h2>
+      <div id="debug"><div class="dim">no route yet</div></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
