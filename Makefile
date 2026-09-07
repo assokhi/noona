@@ -1,4 +1,4 @@
-.PHONY: data graph stats bench snap coord test fmt lint fixture assert ci
+.PHONY: data graph stats bench snap coord serve apibench test fmt lint fixture assert ci
 CARGO ?= cargo
 
 ## Regenerate the Chandigarh extract. Local only - downloads 1.6 GB.
@@ -13,6 +13,10 @@ bench: ; @$(CARGO) run -p bench --release -- run --alg dijkstra,astar,bidir --pa
 snap: ; @$(CARGO) run -p bench --release -- snap --n 1000 --seed 42
 ## Coordinate routing against node routing on the frozen OD set.
 coord: ; @$(CARGO) run -p bench --release -- coord --pairs data/build/od.json
+## Run the HTTP API against the built graph.
+serve: ; @$(CARGO) run -p api --release -- --addr 127.0.0.1:8080 --pool 16
+## Same OD pairs over HTTP, at concurrency 1 and 16. Needs `make serve` running.
+apibench: ; @python tools/http_bench.py
 test: ; @$(CARGO) test --workspace
 fmt: ; @$(CARGO) fmt --all --check
 lint: ; @$(CARGO) clippy --workspace --all-targets -- -D warnings

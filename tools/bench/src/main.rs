@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use graph::Graph;
-use routing::{Route, Search};
+use routing::Search;
 use serde::{Deserialize, Serialize};
 
 const USAGE: &str = "usage: bench gen  [--n N] [--seed S] [--graph graph.bin] [--out od.json]\n\
@@ -70,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut algs = "dijkstra".to_string();
     let mut reference = "dijkstra".to_string();
     let mut json_out: Option<PathBuf> = None;
+    let mut by_coord = false;
 
     let mut rest = args.iter();
     let Some(cmd) = rest.next() else {
@@ -87,13 +88,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--alg" => algs = v.clone(),
             "--reference" => reference = v.clone(),
             "--json" => json_out = Some(PathBuf::from(v)),
+            "--coord" => by_coord = v == "true" || v == "1",
             other => return Err(format!("unknown flag {other}\n{USAGE}").into()),
         }
     }
 
     match cmd.as_str() {
         "gen" => gen(&graph_path, n, seed, &out),
-        "run" => run(&graph_path, &pairs, &algs, &reference, json_out.as_deref()),
+        "run" => run(
+            &graph_path,
+            &pairs,
+            &algs,
+            &reference,
+            json_out.as_deref(),
+            by_coord,
+        ),
         "snap" => snap(&graph_path, n, seed),
         "coord" => coord_gate(&graph_path, &pairs),
         _ => {
@@ -259,21 +268,51 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[i]
 }
 
-fn route(search: &mut Search, g: &Graph, alg: &str, s: u32, t: u32) -> Option<Route> {
-    match alg {
-        "dijkstra" => search.dijkstra(g, s, t),
-        "astar" => search.astar(g, s, t),
-        "bidir" => search.bidirectional(g, s, t),
-        other => panic!("unknown algorithm {other}"),
+/// Either end of the comparison: node ids, or the snapped coordinates the API
+/// actually serves. `--coord` makes the in-process baseline do exactly the work
+/// the HTTP handler does, so the difference between them is purely transport.
+enum Ends {
+    Nodes(Vec<(u32, u32)>),
+    Coords(
+        Vec<(graph::grid::Snap, graph::grid::Snap)>,
+        graph::grid::Metric,
+    ),
+}
+
+fn route(
+    search: &mut Search,
+    g: &Graph,
+    ends: &Ends,
+    i: usize,
+    alg: &str,
+) -> Option<(u32, routing::SearchStats)> {
+    match ends {
+        Ends::Nodes(v) => {
+            let (s, t) = v[i];
+            let r = match alg {
+                "dijkstra" => search.dijkstra(g, s, t),
+                "astar" => search.astar(g, s, t),
+                "bidir" => search.bidirectional(g, s, t),
+                other => panic!("unknown algorithm {other}"),
+            };
+            r.map(|r| (r.cost_ms, r.stats))
+        }
+        Ends::Coords(v, m) => {
+            let (from, to) = v[i];
+            let alg: routing::coord::Alg = alg.parse().expect("unknown algorithm");
+            routing::coord::route(search, g, m, from, to, alg).map(|r| (r.cost_ms, r.stats))
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     graph_path: &Path,
     pairs_path: &Path,
     algs: &str,
     reference: &str,
     json_out: Option<&Path>,
+    by_coord: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (g, _) = Graph::load(graph_path)?;
     let set: PairSet = serde_json::from_slice(&std::fs::read(pairs_path)?)?;
@@ -310,17 +349,35 @@ fn run(
     let mut search = Search::new(g.n_nodes());
 
     // The reference costs every other algorithm must match exactly.
+    let ends = if by_coord {
+        let grid = graph::grid::Grid::build(&g);
+        let m = grid.metric();
+        let snaps = resolved
+            .iter()
+            .map(|(s, t)| {
+                let a = grid.nearest(&g, g.coord(*s), 100.0).expect("origin snaps");
+                let b = grid
+                    .nearest(&g, g.coord(*t), 100.0)
+                    .expect("destination snaps");
+                (a, b)
+            })
+            .collect();
+        Ends::Coords(snaps, m)
+    } else {
+        Ends::Nodes(resolved.clone())
+    };
+
     let mut reference_cost: Vec<u32> = Vec::with_capacity(resolved.len());
-    for (s, t) in &resolved {
-        let r = route(&mut search, &g, reference, *s, *t)
-            .ok_or_else(|| format!("reference {reference} found no route for {s} -> {t}"))?;
-        reference_cost.push(r.cost_ms);
+    for i in 0..resolved.len() {
+        let (cost, _) = route(&mut search, &g, &ends, i, reference)
+            .ok_or_else(|| format!("reference {reference} found no route for pair {i}"))?;
+        reference_cost.push(cost);
     }
 
     // Warm up every algorithm first; these samples are thrown away.
     for alg in &names {
-        for (s, t) in resolved.iter().take(50) {
-            let _ = route(&mut search, &g, alg, *s, *t);
+        for i in 0..resolved.len().min(50) {
+            let _ = route(&mut search, &g, &ends, i, alg);
         }
     }
 
@@ -332,26 +389,26 @@ fn run(
     let mut settled: Vec<Vec<u32>> = vec![Vec::with_capacity(resolved.len()); names.len()];
     let mut relaxed: Vec<u64> = vec![0; names.len()];
     let mut mismatches: Vec<usize> = vec![0; names.len()];
-    for (i, (s, t)) in resolved.iter().enumerate() {
+    for (i, want) in reference_cost.iter().enumerate() {
         for k in 0..names.len() {
             let a = (i + k) % names.len();
             // One query per timing sample, single threaded, monotonic clock.
             let start = Instant::now();
-            let r = route(&mut search, &g, names[a], *s, *t);
+            let r = route(&mut search, &g, &ends, i, names[a]);
             times[a].push(start.elapsed().as_secs_f64() * 1000.0);
             match r {
-                Some(r) => {
-                    if r.cost_ms != reference_cost[i] {
+                Some((cost_ms, stats)) => {
+                    if cost_ms != *want {
                         if mismatches[a] < 5 {
                             eprintln!(
-                                "MISMATCH {} pair {i}: {} ms vs reference {} ms",
-                                names[a], r.cost_ms, reference_cost[i]
+                                "MISMATCH {} pair {i}: {cost_ms} ms vs reference {want} ms",
+                                names[a]
                             );
                         }
                         mismatches[a] += 1;
                     }
-                    settled[a].push(r.stats.nodes_settled);
-                    relaxed[a] += r.stats.edges_relaxed as u64;
+                    settled[a].push(stats.nodes_settled);
+                    relaxed[a] += stats.edges_relaxed as u64;
                 }
                 None => {
                     eprintln!(
