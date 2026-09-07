@@ -1,4 +1,4 @@
-.PHONY: data graph stats bench snap test fmt lint fixture assert ci
+.PHONY: data graph stats bench snap coord test fmt lint fixture assert ci
 CARGO ?= cargo
 
 ## Regenerate the Chandigarh extract. Local only - downloads 1.6 GB.
@@ -11,6 +11,8 @@ stats: ; @$(CARGO) run -p graph --release -- stats
 bench: ; @$(CARGO) run -p bench --release -- run --alg dijkstra,astar,bidir --pairs data/build/od.json --reference dijkstra --json docs/bench-phase2.json
 ## Grid snapping against a brute-force scan of every edge.
 snap: ; @$(CARGO) run -p bench --release -- snap --n 1000 --seed 42
+## Coordinate routing against node routing on the frozen OD set.
+coord: ; @$(CARGO) run -p bench --release -- coord --pairs data/build/od.json
 test: ; @$(CARGO) test --workspace
 fmt: ; @$(CARGO) fmt --all --check
 lint: ; @$(CARGO) clippy --workspace --all-targets -- -D warnings

@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 const USAGE: &str = "usage: bench gen  [--n N] [--seed S] [--graph graph.bin] [--out od.json]\n\
                      \x20      bench run  [--alg a,b,c] [--pairs od.json] [--graph graph.bin] [--reference alg] [--json out.json]\n\
-                     \x20      bench snap [--n N] [--seed S] [--graph graph.bin]";
+                     \x20      bench snap [--n N] [--seed S] [--graph graph.bin]\n\
+                     \x20      bench coord [--pairs od.json] [--graph graph.bin]";
 
 /// Pairs are stored by OSM node id, not by internal index. Internal ids are
 /// dense positions that move whenever the graph is rebuilt; the point of a
@@ -94,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "gen" => gen(&graph_path, n, seed, &out),
         "run" => run(&graph_path, &pairs, &algs, &reference, json_out.as_deref()),
         "snap" => snap(&graph_path, n, seed),
+        "coord" => coord_gate(&graph_path, &pairs),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -475,6 +477,68 @@ fn run(
         "\nall {} algorithms agree with {reference} on every pair",
         report.results.len()
     );
+    Ok(())
+}
+
+/// Routing by coordinate must agree exactly with routing by node id when the
+/// coordinates *are* node coordinates. Any drift is a seeding bug.
+fn coord_gate(graph_path: &Path, pairs_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let (g, _) = Graph::load(graph_path)?;
+    let grid = graph::grid::Grid::build(&g);
+    let m = grid.metric();
+    let set: PairSet = serde_json::from_slice(&std::fs::read(pairs_path)?)?;
+    let index: HashMap<i64, u32> = g
+        .osm_id
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i as u32))
+        .collect();
+
+    let mut search = Search::new(g.n_nodes());
+    let mut mismatches = 0usize;
+    let mut same_edge = 0usize;
+    let mut unsnapped = 0usize;
+    for (i, p) in set.pairs.iter().enumerate() {
+        let (Some(&s), Some(&t)) = (index.get(&p.from_osm), index.get(&p.to_osm)) else {
+            return Err("pair set was generated against a different graph".into());
+        };
+        let want = search.dijkstra(&g, s, t).map(|r| r.cost_ms);
+        let (Some(fs), Some(ts)) = (
+            grid.nearest(&g, g.coord(s), 50.0),
+            grid.nearest(&g, g.coord(t), 50.0),
+        ) else {
+            unsnapped += 1;
+            continue;
+        };
+        for alg in routing::coord::Alg::ALL {
+            let got = routing::coord::route(&mut search, &g, &m, fs, ts, alg);
+            if let Some(r) = &got {
+                if r.same_edge && alg == routing::coord::Alg::Dijkstra {
+                    same_edge += 1;
+                }
+            }
+            let got = got.map(|r| r.cost_ms);
+            if got != want {
+                if mismatches < 5 {
+                    eprintln!(
+                        "MISMATCH pair {i} {}: node route {want:?} ms, coordinate route {got:?} ms",
+                        alg.name()
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+    }
+
+    println!(
+        "coordinate routing: {} pairs x 3 algorithms, {same_edge} resolved on a single edge, {unsnapped} unsnappable",
+        set.pairs.len()
+    );
+    if mismatches > 0 {
+        eprintln!("\n{mismatches} coordinate/node mismatches - this is a gate");
+        std::process::exit(1);
+    }
+    println!("every coordinate route matches its node route exactly");
     Ok(())
 }
 

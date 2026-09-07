@@ -2,12 +2,24 @@
 //!
 //! Costs are milliseconds (u32) so comparisons are exact - the correctness
 //! gate is integer equality against Dijkstra, not equality within an epsilon.
+//!
+//! Every search is seeded: it starts from a set of `(node, cost_already_spent)`
+//! pairs and ends at another such set. Node-to-node routing is the case where
+//! both sets hold one entry at cost zero; coordinate routing is the case where
+//! they hold the endpoints of a snapped edge at their partial costs. Nothing is
+//! ever inserted into the graph.
+
+pub mod coord;
 
 use graph::Graph;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 pub const UNREACHED: u32 = u32::MAX;
+
+/// A search entry point: a node, and the cost already spent getting to it (or,
+/// on the target side, the cost still to spend after leaving it).
+pub type Seed = (u32, u32);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SearchStats {
@@ -18,12 +30,17 @@ pub struct SearchStats {
 
 #[derive(Clone, Debug)]
 pub struct Route {
-    /// Travel time in milliseconds. This is the value the correctness gate
-    /// compares, and it must match Dijkstra exactly.
+    /// Travel time in milliseconds, including any seed costs. This is the value
+    /// the correctness gate compares, and it must match Dijkstra exactly.
     pub cost_ms: u32,
+    /// Length of the graph edges walked. Excludes partial seed legs; coordinate
+    /// routing adds those.
     pub distance_m: f64,
     /// Edge ids in travel order.
     pub edges: Vec<u32>,
+    /// The seed nodes the route actually entered and left by.
+    pub from_node: u32,
+    pub to_node: u32,
     pub stats: SearchStats,
 }
 
@@ -43,9 +60,15 @@ impl Route {
     }
 }
 
+fn seed_cost(seeds: &[Seed], v: u32) -> Option<u32> {
+    seeds.iter().find(|(n, _)| *n == v).map(|(_, c)| *c)
+}
+
 /// Reusable scratch space. Allocating and clearing 40k-entry arrays per query
 /// would dominate p50 and make every later speedup look smaller than it is, so
 /// only the entries a search actually touched get reset.
+///
+/// Not shareable across concurrent requests - the API keeps a pool.
 pub struct Search {
     dist: Vec<u32>,
     parent: Vec<u32>,
@@ -76,6 +99,12 @@ impl Search {
         }
     }
 
+    /// Roughly 20 bytes per node of scratch space.
+    pub fn bytes(&self) -> usize {
+        (self.dist.len() + self.parent.len() + self.h_cache.len()) * 4
+            + (self.dist_b.len() + self.parent_b.len()) * 4
+    }
+
     fn reset(&mut self) {
         for v in self.touched.drain(..) {
             self.dist[v as usize] = UNREACHED;
@@ -90,23 +119,61 @@ impl Search {
         self.heap_b.clear();
     }
 
+    fn seed_forward(&mut self, sources: &[Seed]) {
+        for (v, c) in sources {
+            if *c < self.dist[*v as usize] {
+                if self.dist[*v as usize] == UNREACHED {
+                    self.touched.push(*v);
+                }
+                self.dist[*v as usize] = *c;
+                self.heap.push(Reverse((*c, *v)));
+            }
+        }
+    }
+
+    // -- node to node, the thin wrappers -----------------------------------
+
+    pub fn dijkstra(&mut self, g: &Graph, source: u32, target: u32) -> Option<Route> {
+        self.dijkstra_multi(g, &[(source, 0)], &[(target, 0)])
+    }
+    pub fn astar(&mut self, g: &Graph, source: u32, target: u32) -> Option<Route> {
+        self.astar_multi(g, &[(source, 0)], &[(target, 0)], g.coord(target))
+    }
+    pub fn bidirectional(&mut self, g: &Graph, source: u32, target: u32) -> Option<Route> {
+        self.bidirectional_multi(g, &[(source, 0)], &[(target, 0)])
+    }
+
+    // -- seeded searches ----------------------------------------------------
+
     /// Plain Dijkstra. Lazy deletion rather than decrease-key: duplicates get
     /// pushed and stale pops are skipped, which is less code and faster in
     /// practice on a graph this sparse.
-    pub fn dijkstra(&mut self, g: &Graph, source: u32, target: u32) -> Option<Route> {
+    pub fn dijkstra_multi(
+        &mut self,
+        g: &Graph,
+        sources: &[Seed],
+        targets: &[Seed],
+    ) -> Option<Route> {
         self.reset();
         let mut stats = SearchStats::default();
-        self.dist[source as usize] = 0;
-        self.touched.push(source);
-        self.heap.push(Reverse((0, source)));
+        self.seed_forward(sources);
 
+        let (mut best, mut best_node) = (u32::MAX, UNREACHED);
         while let Some(Reverse((d, u))) = self.heap.pop() {
             if d > self.dist[u as usize] {
                 continue; // stale
             }
+            // Nothing settled from here on can beat what we already have.
+            if d >= best {
+                break;
+            }
             stats.nodes_settled += 1;
-            if u == target {
-                return Some(self.build_route(g, source, target, stats));
+            if let Some(tc) = seed_cost(targets, u) {
+                let total = d.saturating_add(tc);
+                if total < best {
+                    best = total;
+                    best_node = u;
+                }
             }
             for e in g.out_edges(u) {
                 stats.edges_relaxed += 1;
@@ -122,29 +189,47 @@ impl Search {
                 }
             }
         }
-        None
+        (best_node != UNREACHED).then(|| self.build_route(g, sources, best, best_node, stats))
     }
 
-    /// A* with a haversine heuristic.
+    /// A* with a haversine heuristic toward `goal`.
+    ///
+    /// `goal` must lower-bound every target seed: for each target `t` with seed
+    /// cost `tc`, the straight-line time from any node to `goal` has to be at
+    /// most `dist(node, t) + tc`. Coordinate routing satisfies this because the
+    /// targets are the two ends of the destination edge and the goal is the
+    /// snapped point between them. Passing an unrelated goal makes the
+    /// heuristic inadmissible and the answer wrong.
     ///
     /// The heuristic divides by the *maximum* edge speed in the graph, taken
     /// from the file header. Dividing by the average instead is the classic
     /// bug: the heuristic stops being admissible, A* stops being optimal, and
     /// it fails silently - plausible routes that are quietly a little wrong.
     /// Comparing costs against Dijkstra is what catches it.
-    pub fn astar(&mut self, g: &Graph, source: u32, target: u32) -> Option<Route> {
+    pub fn astar_multi(
+        &mut self,
+        g: &Graph,
+        sources: &[Seed],
+        targets: &[Seed],
+        goal: (f64, f64),
+    ) -> Option<Route> {
         self.reset();
         let mut stats = SearchStats::default();
-        let goal = g.coord(target);
         // Metres per millisecond inverted to milliseconds per metre; floor()
         // keeps the estimate at or below the truth after the cast.
         let per_m = 1.0 / g.max_speed_m_per_ms;
+        for (v, c) in sources {
+            if *c < self.dist[*v as usize] {
+                if self.dist[*v as usize] == UNREACHED {
+                    self.touched.push(*v);
+                }
+                self.dist[*v as usize] = *c;
+                let h = Self::heuristic(g, &mut self.h_cache, goal, per_m, *v);
+                self.heap.push(Reverse((c.saturating_add(h), *v)));
+            }
+        }
 
-        self.dist[source as usize] = 0;
-        self.touched.push(source);
-        let h0 = Self::heuristic(g, &mut self.h_cache, goal, per_m, source);
-        self.heap.push(Reverse((h0, source)));
-
+        let (mut best, mut best_node) = (u32::MAX, UNREACHED);
         while let Some(Reverse((f, u))) = self.heap.pop() {
             let d = self.dist[u as usize];
             // Each re-push of a node carries a strictly smaller dist, so any
@@ -152,11 +237,17 @@ impl Search {
             if f > d.saturating_add(Self::heuristic(g, &mut self.h_cache, goal, per_m, u)) {
                 continue;
             }
+            // f bounds the total cost of anything reachable through u.
+            if f >= best {
+                break;
+            }
             stats.nodes_settled += 1;
-            if u == target {
-                let route = self.build_route(g, source, target, stats);
-                self.assert_admissible(g, &route, source, goal, per_m);
-                return Some(route);
+            if let Some(tc) = seed_cost(targets, u) {
+                let total = d.saturating_add(tc);
+                if total < best {
+                    best = total;
+                    best_node = u;
+                }
             }
             for e in g.out_edges(u) {
                 stats.edges_relaxed += 1;
@@ -173,39 +264,12 @@ impl Search {
                 }
             }
         }
-        None
-    }
-
-    /// The heuristic must never over-estimate the remaining cost at any node on
-    /// the route it returned. Catches a unit-conversion slip directly, where the
-    /// harness would only surface it as a mismatch count.
-    ///
-    /// Left debug-only deliberately: this walks the whole path and calls
-    /// haversine per node, on every query. The `release-assert` profile is what
-    /// makes sure it still runs somewhere - see the CI job of that name.
-    fn assert_admissible(
-        &self,
-        g: &Graph,
-        route: &Route,
-        source: u32,
-        goal: (f64, f64),
-        per_m: f64,
-    ) {
-        if !cfg!(debug_assertions) {
-            return;
+        let route =
+            (best_node != UNREACHED).then(|| self.build_route(g, sources, best, best_node, stats));
+        if let Some(r) = &route {
+            self.assert_admissible(g, sources, r, goal, per_m);
         }
-        let mut spent = 0u32;
-        let mut v = source;
-        for e in &route.edges {
-            let remaining = route.cost_ms - spent;
-            let h = (graph::haversine(g.coord(v), goal) * per_m).floor() as u32;
-            debug_assert!(
-                h <= remaining,
-                "heuristic {h} exceeds the true remaining {remaining} ms at node {v}"
-            );
-            spent += g.weight[*e as usize];
-            v = g.head[*e as usize];
-        }
+        route
     }
 
     /// Milliseconds from `v` to the goal at the fastest speed anything in the
@@ -218,6 +282,40 @@ impl Search {
         *slot
     }
 
+    /// The heuristic must never over-estimate the remaining cost at any node on
+    /// the route it returned. Catches a unit-conversion slip directly, where the
+    /// harness would only surface it as a mismatch count.
+    ///
+    /// Left debug-only deliberately: this walks the whole path and calls
+    /// haversine per node, on every query. The `release-assert` profile is what
+    /// makes sure it still runs somewhere - see `make assert`.
+    fn assert_admissible(
+        &self,
+        g: &Graph,
+        sources: &[Seed],
+        route: &Route,
+        goal: (f64, f64),
+        per_m: f64,
+    ) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        // The seed cost was already spent before the first edge, so it is not
+        // part of what remains from any node on the path.
+        let mut spent = seed_cost(sources, route.from_node).unwrap_or(0);
+        let mut v = route.from_node;
+        for e in &route.edges {
+            let remaining = route.cost_ms.saturating_sub(spent);
+            let h = (graph::haversine(g.coord(v), goal) * per_m).floor() as u32;
+            debug_assert!(
+                h <= remaining,
+                "heuristic {h} exceeds the true remaining {remaining} ms at node {v}"
+            );
+            spent += g.weight[*e as usize];
+            v = g.head[*e as usize];
+        }
+    }
+
     /// Bidirectional Dijkstra: forward on the graph, backward on the reverse
     /// graph, alternating by whichever queue has the smaller key.
     ///
@@ -225,28 +323,37 @@ impl Search {
     /// answer: it returns a plausible route that is not the shortest one. Both
     /// searches keep going until `forward_min + backward_min >= mu`, where mu is
     /// the best meeting cost found so far.
-    pub fn bidirectional(&mut self, g: &Graph, source: u32, target: u32) -> Option<Route> {
+    pub fn bidirectional_multi(
+        &mut self,
+        g: &Graph,
+        sources: &[Seed],
+        targets: &[Seed],
+    ) -> Option<Route> {
         self.reset();
-        let stats = SearchStats::default();
-        if source == target {
-            return Some(Route {
-                cost_ms: 0,
-                distance_m: 0.0,
-                edges: Vec::new(),
-                stats,
-            });
+        let mut stats = SearchStats::default();
+        self.seed_forward(sources);
+        for (v, c) in targets {
+            if *c < self.dist_b[*v as usize] {
+                if self.dist_b[*v as usize] == UNREACHED {
+                    self.touched_b.push(*v);
+                }
+                self.dist_b[*v as usize] = *c;
+                self.heap_b.push(Reverse((*c, *v)));
+            }
         }
-        let mut stats = stats;
-
-        self.dist[source as usize] = 0;
-        self.touched.push(source);
-        self.heap.push(Reverse((0, source)));
-        self.dist_b[target as usize] = 0;
-        self.touched_b.push(target);
-        self.heap_b.push(Reverse((0, target)));
 
         let mut mu = u32::MAX;
         let mut meet = UNREACHED;
+        // A source that is also a target closes the route with no search at all.
+        for (v, c) in sources {
+            if let Some(tc) = seed_cost(targets, *v) {
+                let total = c.saturating_add(tc);
+                if total < mu {
+                    mu = total;
+                    meet = *v;
+                }
+            }
+        }
 
         loop {
             let fmin = self.heap.peek().map_or(u32::MAX, |Reverse((k, _))| *k);
@@ -334,46 +441,62 @@ impl Search {
             return None;
         }
 
-        // Forward half back to the source, then the backward parents out to
-        // the target.
+        // Forward half back to a source seed, then the backward parents out to
+        // a target seed.
         let mut edges = Vec::new();
         let mut v = meet;
-        while v != source {
+        while self.parent[v as usize] != UNREACHED {
             let e = self.parent[v as usize];
             edges.push(e);
             v = g.edge_source(e as usize);
         }
+        let from_node = v;
         edges.reverse();
         let mut v = meet;
-        while v != target {
+        while self.parent_b[v as usize] != UNREACHED {
             let e = self.parent_b[v as usize];
             edges.push(e);
             v = g.head[e as usize];
         }
+        let to_node = v;
         let distance_m = edges.iter().map(|e| g.length[*e as usize] as f64).sum();
         Some(Route {
             cost_ms: mu,
             distance_m,
             edges,
+            from_node,
+            to_node,
             stats,
         })
     }
 
-    fn build_route(&self, g: &Graph, source: u32, target: u32, stats: SearchStats) -> Route {
+    fn build_route(
+        &self,
+        g: &Graph,
+        sources: &[Seed],
+        cost_ms: u32,
+        target_node: u32,
+        stats: SearchStats,
+    ) -> Route {
         let mut edges = Vec::new();
-        let mut v = target;
-        while v != source {
+        let mut v = target_node;
+        while self.parent[v as usize] != UNREACHED {
             let e = self.parent[v as usize];
-            assert_ne!(e, UNREACHED, "no parent edge on the settled path");
             edges.push(e);
             v = g.edge_source(e as usize);
         }
+        assert!(
+            seed_cost(sources, v).is_some(),
+            "path walked back to {v}, which is not a source seed"
+        );
         edges.reverse();
         let distance_m = edges.iter().map(|e| g.length[*e as usize] as f64).sum();
         Route {
-            cost_ms: self.dist[target as usize],
+            cost_ms,
             distance_m,
             edges,
+            from_node: v,
+            to_node: target_node,
             stats,
         }
     }
@@ -393,7 +516,7 @@ mod tests {
 
     /// A grid with ties everywhere, plus one row that is one-way eastbound so
     /// the reverse graph genuinely differs from the forward one.
-    fn grid() -> Graph {
+    pub(crate) fn grid_graph() -> Graph {
         let mut coords = Vec::new();
         for row in 0..6 {
             for col in 0..6 {
@@ -440,7 +563,7 @@ mod tests {
 
     #[test]
     fn astar_and_bidir_agree_with_dijkstra_on_every_grid_pair() {
-        let g = grid();
+        let g = grid_graph();
         let mut s = Search::new(g.n_nodes());
         let mut checked = 0;
         for a in 0..36u32 {
@@ -461,7 +584,7 @@ mod tests {
 
     #[test]
     fn every_route_is_a_walkable_chain_of_edges() {
-        let g = grid();
+        let g = grid_graph();
         let mut s = Search::new(g.n_nodes());
         for (a, b) in [(0u32, 35u32), (35, 0), (5, 30), (17, 3)] {
             for r in [
@@ -479,6 +602,56 @@ mod tests {
                 assert_eq!(v, b, "route does not end at the target");
                 assert_eq!(cost, r.cost_ms, "reported cost is not the path cost");
             }
+        }
+    }
+
+    #[test]
+    fn seeds_are_added_to_the_cost() {
+        let g = line();
+        let mut s = Search::new(g.n_nodes());
+        // Half an edge already spent at each end.
+        let r = s.dijkstra_multi(&g, &[(0, 400)], &[(2, 600)]).unwrap();
+        assert_eq!(r.cost_ms, 400 + 2000 + 600);
+        assert_eq!(r.from_node, 0);
+        assert_eq!(r.to_node, 2);
+    }
+
+    #[test]
+    fn the_cheaper_of_two_seeds_wins() {
+        let g = line();
+        let mut s = Search::new(g.n_nodes());
+        // Entering at node 1 costs 5000 up front; entering at 0 costs nothing.
+        let r = s
+            .dijkstra_multi(&g, &[(0, 0), (1, 5000)], &[(2, 0)])
+            .unwrap();
+        assert_eq!(r.cost_ms, 2000);
+        assert_eq!(r.from_node, 0);
+        // Now make node 1 the bargain.
+        let r = s
+            .dijkstra_multi(&g, &[(0, 3000), (1, 10)], &[(2, 0)])
+            .unwrap();
+        assert_eq!(r.cost_ms, 1010);
+        assert_eq!(r.from_node, 1);
+    }
+
+    #[test]
+    fn seeded_searches_agree_across_algorithms() {
+        let g = grid_graph();
+        let mut s = Search::new(g.n_nodes());
+        // Targets are the two ends of one edge and the goal sits between them,
+        // which is the shape coordinate routing always produces. An arbitrary
+        // goal would make the heuristic inadmissible - see astar_multi.
+        let (t0, t1) = (34u32, 35u32);
+        let (c0, c1) = (g.coord(t0), g.coord(t1));
+        let goal = ((c0.0 + c1.0) / 2.0, (c0.1 + c1.1) / 2.0);
+        for (sa, sb) in [(0u32, 7u32), (13, 20), (2, 9)] {
+            let sources = [(sa, 250), (sb, 900)];
+            let targets = [(t0, 500), (t1, 500)];
+            let d = s.dijkstra_multi(&g, &sources, &targets).unwrap();
+            let a = s.astar_multi(&g, &sources, &targets, goal).unwrap();
+            let b = s.bidirectional_multi(&g, &sources, &targets).unwrap();
+            assert_eq!(d.cost_ms, a.cost_ms, "astar disagrees on seeded {sa}/{sb}");
+            assert_eq!(d.cost_ms, b.cost_ms, "bidir disagrees on seeded {sa}/{sb}");
         }
     }
 

@@ -50,6 +50,68 @@ impl Metric {
     }
 }
 
+impl Metric {
+    /// Planar length of one polyline segment, in metres. Same frame the snap
+    /// offsets were measured in, so slicing by offset stays consistent.
+    pub fn seg_len(&self, a: [f32; 2], b: [f32; 2]) -> f64 {
+        let dx = (b[0] as f64 - a[0] as f64) * self.m_per_deg_lon;
+        let dy = (b[1] as f64 - a[1] as f64) * self.m_per_deg_lat;
+        (dx * dx + dy * dy).sqrt()
+    }
+}
+
+fn lerp(a: [f32; 2], b: [f32; 2], t: f64) -> [f32; 2] {
+    [
+        (a[0] as f64 + t * (b[0] as f64 - a[0] as f64)) as f32,
+        (a[1] as f64 + t * (b[1] as f64 - a[1] as f64)) as f32,
+    ]
+}
+
+/// The stretch of an edge polyline between two offsets from its source, with
+/// both ends interpolated. Used for the partial legs between a snapped point
+/// and the node a search actually started from.
+pub fn sub_polyline(g: &Graph, edge: usize, from_m: f64, to_m: f64, m: &Metric) -> Vec<[f32; 2]> {
+    let (from_m, to_m) = (from_m.min(to_m).max(0.0), to_m.max(from_m));
+    let mut out: Vec<[f32; 2]> = Vec::new();
+    let mut travelled = 0.0f64;
+    let mut prev: Option<[f32; 2]> = None;
+    let mut last_point: Option<[f32; 2]> = None;
+
+    for p in g.geometry(edge) {
+        last_point = Some(p);
+        let Some(a) = prev else {
+            prev = Some(p);
+            continue;
+        };
+        let seg = m.seg_len(a, p);
+        let (s0, s1) = (travelled, travelled + seg);
+        if seg > 0.0 && s1 >= from_m && s0 <= to_m {
+            let t0 = ((from_m - s0) / seg).clamp(0.0, 1.0);
+            let t1 = ((to_m - s0) / seg).clamp(0.0, 1.0);
+            let p0 = lerp(a, p, t0);
+            let p1 = lerp(a, p, t1);
+            if out.is_empty() {
+                out.push(p0);
+            }
+            if out.last() != Some(&p1) {
+                out.push(p1);
+            }
+        }
+        travelled = s1;
+        prev = Some(p);
+    }
+    // A zero-length slice still needs two points to be a LineString.
+    if out.is_empty() {
+        if let Some(p) = last_point {
+            out.push(p);
+        }
+    }
+    if out.len() == 1 {
+        out.push(out[0]);
+    }
+    out
+}
+
 /// Where a coordinate landed on the road network.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Snap {
@@ -109,9 +171,23 @@ fn project(g: &Graph, edge: usize, at: (f64, f64), m: &Metric) -> (f64, f64, (f6
     best
 }
 
+/// Offsets closer than this to either end of an edge are pulled onto the end.
+///
+/// Geometry is stored as f32, whose ulp near longitude 76.7 is about 7.6e-6
+/// degrees - roughly 0.73 m. A point sitting exactly on a junction therefore
+/// projects up to about that far along the adjoining edge, which would invent a
+/// sub-metre partial edge and shift a route cost by a millisecond. Below the
+/// precision of the stored geometry there is nothing real to represent.
+pub const ENDPOINT_SNAP_M: f64 = 1.0;
+
 fn snap_from(g: &Graph, edge: usize, at: (f64, f64), m: &Metric) -> Snap {
-    let (distance_m, offset_m, point) = project(g, edge, at, m);
+    let (distance_m, mut offset_m, point) = project(g, edge, at, m);
     let len = g.length[edge] as f64;
+    if offset_m < ENDPOINT_SNAP_M {
+        offset_m = 0.0;
+    } else if len - offset_m < ENDPOINT_SNAP_M {
+        offset_m = len;
+    }
     let frac = if len > 0.0 {
         (offset_m / len).clamp(0.0, 1.0)
     } else {
