@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 use graph::Graph;
 use routing::Search;
 
-/// (name, from lon/lat, to lon/lat, what it is meant to exercise)
-const ROUTES: [(&str, (f64, f64), (f64, f64), &str); 4] = [
+/// name, from `(lon, lat)`, to `(lon, lat)`, what it is meant to exercise.
+type Eyeball = (&'static str, (f64, f64), (f64, f64), &'static str);
+
+const ROUTES: [Eyeball; 4] = [
     (
         "sector17-plaza-to-pgimer",
         (76.7794, 30.7410),
@@ -119,6 +121,9 @@ fn geojson(g: &Graph, name: &str, note: &str, r: &routing::Route) -> String {
     s
 }
 
+/// One run of consecutive same-class edges: `(class, start_m, end_m)`.
+type ClassRun = (String, f64, f64);
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
@@ -171,7 +176,7 @@ fn four_routes_match_their_golden_files() {
         // is: service road at the very end is a campus or a driveway, service
         // road in the middle is the search cutting through a parking lot.
         let mut travelled = 0.0f64;
-        let mut runs: Vec<(String, f64, f64)> = Vec::new();
+        let mut runs: Vec<ClassRun> = Vec::new();
         for e in &d.edges {
             let c = g.edge_class(*e as usize).to_string();
             let m = g.length[*e as usize] as f64;
