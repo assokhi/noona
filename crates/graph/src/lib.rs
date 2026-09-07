@@ -7,6 +7,8 @@
 //! - edge weights are milliseconds (u32), so the priority queue stays integral
 //! - node ids are dense u32 indices, NOT OSM ids (`osm_id` is a debug side table)
 
+pub mod grid;
+
 use osm_parse::{Oneway, Way};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
