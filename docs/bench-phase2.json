@@ -1,0 +1,64 @@
+{
+  "machine": {
+    "cpu": "12th Gen Intel(R) Core(TM) i5-12500H",
+    "ram_gb": "16",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "profile": "release opt-level=3, thin LTO, codegen-units=1"
+  },
+  "graph": {
+    "path": "data/build/graph.bin",
+    "nodes": 40572,
+    "edges": 103658,
+    "max_speed_kmh": 70.02266484337885
+  },
+  "pair_set": {
+    "path": "data/build/od.json",
+    "seed": 42,
+    "count": 1000
+  },
+  "reference": "dijkstra",
+  "results": [
+    {
+      "alg": "dijkstra",
+      "queries": 1000,
+      "p50_ms": 2.7701000000000002,
+      "p95_ms": 5.431,
+      "p99_ms": 6.6454,
+      "max_ms": 7.8972,
+      "nodes_settled_mean": 21103.252,
+      "nodes_settled_max": 40567,
+      "edges_relaxed_mean": 54048.314,
+      "mismatches": 0,
+      "speedup_vs_reference": 1.0,
+      "settled_ratio_vs_reference": 1.0
+    },
+    {
+      "alg": "astar",
+      "queries": 1000,
+      "p50_ms": 2.0655,
+      "p95_ms": 6.0599,
+      "p99_ms": 7.7961,
+      "max_ms": 9.9747,
+      "nodes_settled_mean": 11017.149,
+      "nodes_settled_max": 38587,
+      "edges_relaxed_mean": 28275.076,
+      "mismatches": 0,
+      "speedup_vs_reference": 1.341128056160736,
+      "settled_ratio_vs_reference": 1.9154912037587948
+    },
+    {
+      "alg": "bidir",
+      "queries": 1000,
+      "p50_ms": 1.7518,
+      "p95_ms": 4.585500000000001,
+      "p99_ms": 5.6185,
+      "max_ms": 8.4306,
+      "nodes_settled_mean": 12025.592,
+      "nodes_settled_max": 31858,
+      "edges_relaxed_mean": 30854.169,
+      "mismatches": 0,
+      "speedup_vs_reference": 1.581287818244092,
+      "settled_ratio_vs_reference": 1.7548617980719785
+    }
+  ]
+}

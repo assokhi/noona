@@ -1,0 +1,10 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+graph = { path = "../../crates/graph" }
+routing = { path = "../../crates/routing" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

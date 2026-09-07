@@ -1,6 +1,7 @@
 data/raw/*
 !data/raw/PROVENANCE
-data/build/
+data/build/*
+!data/build/od.json
 target/
 node_modules/
 tools/bin/

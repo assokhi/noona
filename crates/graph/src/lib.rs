@@ -123,6 +123,17 @@ impl Graph {
     pub fn coord(&self, v: u32) -> (f64, f64) {
         (self.lon[v as usize], self.lat[v as usize])
     }
+    /// The `highway` class this edge came from. For inspection and debugging;
+    /// nothing routes on it.
+    pub fn edge_class(&self, edge: usize) -> &'static str {
+        osm_parse::CLASSES[(self.flags[edge] & osm_parse::FLAG_CLASS_MASK) as usize].0
+    }
+    /// The node an edge leaves. Recovered from the CSR offsets instead of being
+    /// stored: the last offset that is still <= the edge id is the node that
+    /// owns it, which stays correct even if some node ever has out-degree 0.
+    pub fn edge_source(&self, edge: usize) -> u32 {
+        (self.offsets.partition_point(|o| *o as usize <= edge) - 1) as u32
+    }
     /// A stable id for the undirected road segment behind a directed edge:
     /// the lower of the edge and its twin.
     pub fn pair_of(&self, edge: usize) -> u32 {
@@ -558,6 +569,38 @@ fn emit_way(
         poly.clear();
         poly.push(p);
         acc = 0.0;
+    }
+}
+
+impl Graph {
+    /// Build a graph straight from coordinates and `(src, dst, weight_ms)`
+    /// triples, with straight-line geometry. For tests and small examples;
+    /// the real thing comes from `build`.
+    pub fn from_edges(coords: &[(f64, f64)], edges: &[(u32, u32, u32)]) -> Graph {
+        let point = |v: u32| {
+            let c = coords[v as usize];
+            [c.0 as f32, c.1 as f32]
+        };
+        let raw = edges
+            .iter()
+            .map(|(s, d, w)| RawEdge {
+                src: *s,
+                dst: *d,
+                weight: *w,
+                length: haversine(coords[*s as usize], coords[*d as usize]) as f32,
+                flags: 0,
+                name_id: NO_NAME,
+                geom: vec![point(*s), point(*d)],
+            })
+            .collect();
+        assemble(
+            coords.iter().map(|c| c.0).collect(),
+            coords.iter().map(|c| c.1).collect(),
+            (0..coords.len() as i64).collect(),
+            vec![0; coords.len()],
+            raw,
+            Vec::new(),
+        )
     }
 }
 

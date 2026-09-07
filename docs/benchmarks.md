@@ -93,6 +93,16 @@ Nodes deliberately left uncontracted: 411 carrying `highway=traffic_signals` or
 `barrier=*`, 16 whose two segments disagree about being two-way, 7 holding a
 degree-2 ring open.
 
+### A bug this surfaced
+
+The first implementation derived the two-directions-of-one-road relation from OSM
+way provenance: both directions emitted from one way shared an id. That silently
+fails on a street mapped as two separate one-way ways - a real case in this
+extract - and made total road length depend on how a mapper chose to split
+geometry. It is now decided structurally: two directed edges are the same road iff
+they run between the same nodes over the identical polyline, reversed. Dual
+carriageways keep distinct polylines and correctly stay unpaired.
+
 ## Phase 1c - two audits
 
 **Geometry sharing.** An edge and its reverse each stored their own copy of the
@@ -116,7 +126,7 @@ anyone adds a speed boost and makes A\* inadmissible.
 | v2 (contracted, `node_flags` + `twin`) | 7,422,251 | +2.9% |
 | v3 (shared geometry, header `max_speed`) | 6,620,559 | -8.2% |
 
-### A second bug this surfaced
+### A second bug, found during the audit
 
 Contraction copied each source edge's flag byte onto the spliced edge, including
 `FLAG_GEOM_REVERSED` - a storage detail of one particular arena, not a property of
@@ -126,28 +136,100 @@ the build that matters runs `--release`. It is now a plain `assert!`: one
 comparison per edge, and the class of bug it catches draws the wrong line on the
 map while costing exactly the right amount.
 
-### A bug this surfaced
+## Phase 2 - baseline routing
 
-The first implementation derived the two-directions-of-one-road relation from OSM
-way provenance: both directions emitted from one way shared an id. That silently
-fails on a street mapped as two separate one-way ways - a real case in this
-extract - and made total road length depend on how a mapper chose to split
-geometry. It is now decided structurally: two directed edges are the same road iff
-they run between the same nodes over the identical polyline, reversed. Dual
-carriageways keep distinct polylines and correctly stay unpaired.
+1000 OD pairs, seed 42, frozen in `data/build/od.json` and committed. Endpoints
+are sampled with probability proportional to the road length meeting at the node,
+so the set reflects realistic trips rather than oversampling dense sector
+interiors: straight-line separation min 0.54 km, p50 9.18 km, p95 17.23 km, max
+21.87 km. Pairs closer than 500 m are rejected, as is anything not mutually
+reachable. Pairs are stored by OSM node id, not internal index, so they survive a
+graph rebuild.
 
-## Phase 2 - routing
+Machine: 12th Gen Intel Core i5-12500H, 16 GB RAM, rustc 1.98.1, release
+(opt-level=3, thin LTO, codegen-units=1), single threaded.
+Graph: 40,572 nodes / 103,658 edges, fastest edge 70.0 km/h.
 
-Not built yet. Same 1000 OD pairs and a committed seed, measured on the
-**post-contraction** graph (40,572 nodes / 103,658 edges):
+| Algorithm | Prep | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | Nodes settled (mean) | Nodes settled (max) | Edges relaxed (mean) | Latency vs Dijkstra | Work vs Dijkstra | Mismatches |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Dijkstra | - | 2.770 | 5.431 | 6.645 | 7.897 | 21,103 | 40,567 | 54,048 | 1.00x | 1.00x | **0** |
+| A\* | - | 2.066 | 6.060 | 7.796 | 9.975 | 11,017 | 38,587 | 28,275 | 1.34x | 1.92x | **0** |
+| Bidirectional Dijkstra | - | 1.752 | 4.586 | 5.619 | 8.431 | 12,026 | 31,858 | 30,854 | 1.58x | 1.75x | **0** |
+| ALT (16 landmarks) | | | | | | | | | | | |
+| CH | | | | | | | | | | | |
 
-| Algorithm | Prep time | Prep memory | p50 (ms) | p95 (ms) | p99 (ms) | Nodes settled (mean) | Speedup vs Dijkstra |
-|---|---|---|---|---|---|---|---|
-| Dijkstra | - | - | | | | | 1.0x |
-| A\* | - | - | | | | | |
-| Bidirectional Dijkstra | - | - | | | | | |
-| ALT (16 landmarks) | | | | | | | |
-| CH | | | | | | | |
+All three return costs exactly equal to Dijkstra on all 1000 pairs. The harness
+exits non-zero on any mismatch, so it is a gate rather than a report.
+
+Dijkstra settles 21,103 nodes on average out of 40,572 - just over half the graph
+for a median 9 km trip, which is what a search with no sense of direction costs.
+
+### Two things the harness caught about itself
+
+**Timing algorithms in sequence was measuring the CPU, not the code.** Run to run,
+p50 moved by 2x (Dijkstra 2.66 to 4.81 ms) while nodes settled was identical to
+the node every time. Worse, the ordering was systematic: algorithms were timed one
+after another, so the last one ran on a hotter, higher-clocked core than the first,
+and in one run that flipped the ranking of A\* and bidirectional. The harness now
+interleaves the algorithms per pair, rotating which goes first. Run-to-run spread
+dropped from ~2x to under 2%, and the ranking stopped moving.
+
+This is the concrete version of why the spec asks for nodes settled alongside
+latency: the settled counts were correct and stable the whole time the latency
+numbers were lying.
+
+**A\* was slower than Dijkstra despite settling half as many nodes.** First
+measurement: 1.92x less work, 0.95x the speed. Haversine is four trig calls, and
+the heuristic was being recomputed on every push and every pop - roughly three
+times per edge relaxation. Memoising it per node per query moved A\* to 1.34x.
+It still converts its 1.92x work advantage into only 1.34x wall clock, because
+the remaining heuristic evaluations and the larger heap keys are not free.
+
+Bidirectional search wins on latency (1.58x) despite settling *more* nodes than
+A\* (12,026 vs 11,017), because its inner loop is plain integer arithmetic with
+no trigonometry at all.
+
+### Notes on the implementation
+
+- Lazy-deletion heaps throughout: duplicates are pushed and stale pops skipped.
+- `Search` holds the scratch arrays and resets only the entries a query touched.
+  Clearing 40k-entry arrays per query would have dominated p50.
+- A\* divides by `max_speed_m_per_ms` from the file header, and `floor()`s the
+  result so the cast cannot round the estimate up above the truth. A debug-only
+  assertion walks the returned path and checks the heuristic never exceeds the
+  true remaining cost.
+- Bidirectional stops on `forward_min + backward_min >= mu`, not at the first
+  meeting node. The 1000-pair gate is what would catch the difference.
+
+### Eyeball check
+
+Four routes in `tests/golden/`, regenerated with
+`UPDATE_GOLDEN=1 cargo test -p routing`. All three algorithms agree on each.
+
+| Route | Distance | Duration | Avg | Road classes |
+|---|---|---|---|---|
+| Sector 17 Plaza to PGIMER | 4.60 km | 9.6 min | 29 km/h | secondary 68%, service 26%, residential 5% |
+| Sukhna Lake to airport | 14.42 km | 21.0 min | 41 km/h | secondary 52%, tertiary 23%, trunk 20%, service 3% |
+| Sector 17 to Mohali Phase 7 | 8.51 km | 12.0 min | 42 km/h | secondary 91%, residential 8%, trunk 1% |
+| Inside Sector 40 | 2.05 km | 3.0 min | 41 km/h | secondary 63%, tertiary 37% |
+
+The golden files carry the road-class mix and the named streets in travel order,
+which is the part of "does this look sane" that can be checked without a map.
+
+- **The 26% service road on the PGIMER route is not a parking-lot shortcut.** It
+  is one contiguous run from 75% to 100% of the way - the hospital campus, whose
+  internal roads are genuinely `service`. Same shape on the airport route: 481 m
+  of service from 97% to 100%, the terminal approach. No route has a service run
+  anywhere in its middle, which is what a cut-through would look like.
+- **The Mohali route crosses the UT boundary and stays on arterials for 91% of
+  its length**, so the coarse-cut margin and the complete_ways back-fill are
+  doing their job - no dead end at the boundary.
+- **The Sector 40 hop uses no residential road at all.** Two readings: the two
+  points are about 1 km apart and span more than one sector, and Chandigarh
+  sector interiors are deliberately not through-routes, so leaving to the V3/V4
+  boundary and coming back is the real-world answer. The 2x detour over the
+  straight line is expected here rather than suspicious. The route name overstates
+  what it tests.
 
 ## Finding: `maxspeed` coverage is 0.4%
 
