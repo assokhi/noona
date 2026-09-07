@@ -741,7 +741,7 @@ pub fn contract(g: Graph) -> (Graph, ContractStats) {
                     c.fwd.1
                 } else {
                     let bwd = c.bwd.expect("arrived at a one-way chain from behind");
-                    debug_assert_eq!(cur_edge, bwd.0);
+                    assert_eq!(cur_edge, bwd.0, "chain walk entered {cur} on a stray edge");
                     bwd.1
                 };
                 weight += g.weight[next as usize] as u64;
@@ -753,9 +753,11 @@ pub fn contract(g: Graph) -> (Graph, ContractStats) {
                 cur_edge = next;
                 stats.splices += 1;
             }
-            debug_assert_ne!(remap[cur as usize], u32::MAX);
-            // Silently reversed geometry is the classic bug here: it costs the
-            // right amount and draws the wrong line.
+            assert_ne!(
+                remap[cur as usize],
+                u32::MAX,
+                "chain walk ended on a node that was itself contracted"
+            );
             // One comparison per edge, kept in release: silently reversed
             // geometry costs the right amount and draws the wrong line, and a
             // debug_assert here would never run in the build that matters.
@@ -945,7 +947,8 @@ fn assemble(
         .iter()
         .map(|e| e.length as f64 / e.weight as f64)
         .fold(0.0, f64::max);
-    debug_assert!(
+    // One pass over the edge list during a build that already takes 650 ms.
+    assert!(
         edges
             .iter()
             .all(|e| e.length as f64 / e.weight as f64 <= max_speed_m_per_ms),

@@ -27,7 +27,8 @@ jobs:
       - name: pyosmium
         run: python -m pip install --quiet osmium
 
-      # make ci = fmt + lint + test + fixture. Running it through make is what
-      # keeps the Makefile from rotting.
+      # make ci = fmt + lint + test + fixture + assert. Running it through make
+      # is what keeps the Makefile from rotting. The assert target builds under
+      # release-assert, which is the only place the debug-only assertions run.
       - name: make ci
         run: make ci

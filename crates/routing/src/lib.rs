@@ -176,9 +176,13 @@ impl Search {
         None
     }
 
-    /// Debug-only: the heuristic must never over-estimate the remaining cost at
-    /// any node on the route it returned. Catches a unit-conversion slip
-    /// directly, where the harness would only surface it as a mismatch count.
+    /// The heuristic must never over-estimate the remaining cost at any node on
+    /// the route it returned. Catches a unit-conversion slip directly, where the
+    /// harness would only surface it as a mismatch count.
+    ///
+    /// Left debug-only deliberately: this walks the whole path and calls
+    /// haversine per node, on every query. The `release-assert` profile is what
+    /// makes sure it still runs somewhere - see the CI job of that name.
     fn assert_admissible(
         &self,
         g: &Graph,
@@ -360,7 +364,7 @@ impl Search {
         let mut v = target;
         while v != source {
             let e = self.parent[v as usize];
-            debug_assert_ne!(e, UNREACHED, "no parent edge on the settled path");
+            assert_ne!(e, UNREACHED, "no parent edge on the settled path");
             edges.push(e);
             v = g.edge_source(e as usize);
         }

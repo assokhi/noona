@@ -1,13 +1,19 @@
-.PHONY: data graph test fmt lint fixture ci
+.PHONY: data graph stats bench test fmt lint fixture assert ci
 CARGO ?= cargo
 
 ## Regenerate the Chandigarh extract. Local only - downloads 1.6 GB.
 data: ; @bash tools/data.sh
 ## Build data/build/graph.bin from the extract.
 graph: ; @$(CARGO) run -p graph --release -- build
+## Degree histogram and contractibility diagnosis for the built graph.
+stats: ; @$(CARGO) run -p graph --release -- stats
+## The correctness gate over the frozen OD set.
+bench: ; @$(CARGO) run -p bench --release -- run --alg dijkstra,astar,bidir --pairs data/build/od.json --reference dijkstra --json docs/bench-phase2.json
 test: ; @$(CARGO) test --workspace
 fmt: ; @$(CARGO) fmt --all --check
 lint: ; @$(CARGO) clippy --workspace --all-targets -- -D warnings
 ## Full clip -> build -> assert path against the committed fixture, no download.
 fixture: ; @bash tools/fixture.sh
-ci: fmt lint test fixture
+## Same paths under a profile that forces debug assertions on in release.
+assert: ; @bash tools/assert.sh
+ci: fmt lint test fixture assert

@@ -189,6 +189,62 @@ Bidirectional search wins on latency (1.58x) despite settling *more* nodes than
 A\* (12,026 vs 11,017), because its inner loop is plain integer arithmetic with
 no trigonometry at all.
 
+### Why A\* only converts 1.92x work into 1.34x time
+
+Worth writing down properly, because it is a property of this graph rather than
+of this implementation, and it sets up the next work package.
+
+The heuristic is `haversine / max_speed`, and `max_speed` is 70.0 km/h. That
+constant is data-derived and correct: it is the fastest edge in the graph, and
+anything larger breaks admissibility. But the *typical* edge runs at 25-35 km/h,
+because 99.6% of edges take a class default and most of Chandigarh is residential
+and tertiary. So the lower bound is loose by roughly the ratio of fastest to
+typical speed, compounded again by the detour factor of a real road network
+against a straight line. A bound that is around 3x optimistic gives weak
+guidance, and A\* degrades toward Dijkstra - which is exactly the shape of the
+measurement: it still explores 11,017 nodes out of 40,572.
+
+**This is not fixable by tuning.** `max_speed` is already the tightest admissible
+constant available. Lowering it would be faster and wrong. The only route to a
+tight bound is one that encodes actual network distances rather than a speed
+assumption, which is what ALT landmarks do, and it is why they are immune to
+speed heterogeneity.
+
+**Prediction for the next work package:** ALT should beat A\* here by a wide
+margin, for precisely this reason, and the gap should be larger on this graph
+than the literature's road-network averages because our speed spread is unusually
+wide relative to a European extract with good `maxspeed` coverage. That is a
+falsifiable claim and the ALT row in this table is the test.
+
+Second-order, and a nice illustration of data quality feeding algorithm
+performance: if Phase 6 derives per-class speeds from map-matched GPS traces and
+those narrow the class spread, **A\* gets faster for free**, with no change to
+the search at all. The heuristic tightens because the graph got more honest.
+
+### Assertion audit
+
+The `FLAG_GEOM_REVERSED` splice bug survived because its guard was a
+`debug_assert!` and the build that matters is `--release`. Every assertion in the
+workspace is now sorted into one of two buckets:
+
+| Guard | Bucket | Where |
+|---|---|---|
+| Spliced polyline runs source to target | data | `graph::contract` |
+| Chain walk entered on a known edge | data | `graph::contract` |
+| Chain walk ended on a surviving node | data | `graph::contract` |
+| No edge exceeds the header `max_speed` | data | `graph::assemble` |
+| Header `max_speed` bounds every edge on load | data | `Graph::read_from` |
+| Path reconstruction has a parent edge | data | `routing::build_route` |
+| A\* heuristic never over-estimates on the returned path | algorithmic | `routing::astar` |
+
+Data-correctness guards are now plain `assert!`: they run once per edge inside a
+build that already takes 650 ms, so the cost is noise. The one algorithmic guard
+walks the whole path calling haversine on every query, so it stays
+`debug_assert!` - and `make assert` builds under a `release-assert` profile
+(`debug-assertions = true`, `overflow-checks = true`) and runs the fixture build
+plus a 100-pair bench under it, so that bucket is exercised rather than being
+dead code that provides false comfort. It is part of `make ci`.
+
 ### Notes on the implementation
 
 - Lazy-deletion heaps throughout: duplicates are pushed and stale pops skipped.
