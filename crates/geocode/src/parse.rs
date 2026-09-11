@@ -173,7 +173,10 @@ mod tests {
     fn house_numbers() {
         assert_eq!(parse("#234 sector 40").housenumber.as_deref(), Some("234"));
         assert_eq!(parse("h.no 234 sec 40").housenumber.as_deref(), Some("234"));
-        assert_eq!(parse("house 234 sector 40").housenumber.as_deref(), Some("234"));
+        assert_eq!(
+            parse("house 234 sector 40").housenumber.as_deref(),
+            Some("234")
+        );
         // Bare leading number only counts once a sector is present.
         assert_eq!(parse("234 sector 40").housenumber.as_deref(), Some("234"));
         assert_eq!(parse("234").housenumber, None);

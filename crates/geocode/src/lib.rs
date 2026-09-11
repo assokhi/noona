@@ -191,9 +191,8 @@ impl Index {
             }
         }
 
-        let in_pool: Option<std::collections::HashSet<u32>> = addr
-            .sector
-            .map(|_| pool.iter().copied().collect());
+        let in_pool: Option<std::collections::HashSet<u32>> =
+            addr.sector.map(|_| pool.iter().copied().collect());
         let mut hits: Vec<Hit> = shared
             .into_iter()
             .filter(|(id, _)| in_pool.as_ref().is_none_or(|p| p.contains(id)))
@@ -206,7 +205,10 @@ impl Index {
                 let contains = if name.contains(&text) { 0.35 } else { 0.0 };
                 let starts = if name.starts_with(&text) { 0.25 } else { 0.0 };
                 Hit {
-                    score: similarity + contains + starts + f.prominence as f64 / 20.0
+                    score: similarity
+                        + contains
+                        + starts
+                        + f.prominence as f64 / 20.0
                         + self.proximity(id, near),
                     feature: f.clone(),
                 }
@@ -290,7 +292,10 @@ mod tests {
     fn a_bare_sector_matches_its_subdivisions() {
         let idx = index();
         let hits = idx.search("sector 17", 10, None);
-        let numbers: Vec<u8> = hits.iter().map(|h| h.feature.sector.unwrap().number).collect();
+        let numbers: Vec<u8> = hits
+            .iter()
+            .map(|h| h.feature.sector.unwrap().number)
+            .collect();
         assert!(numbers.iter().all(|n| *n == 17));
         // 17 and 17-C both.
         assert!(hits.len() >= 2, "{hits:#?}");

@@ -68,8 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "query" => {
-            let features: Vec<geocode::Feature> =
-                serde_json::from_slice(&std::fs::read(&out)?)?;
+            let features: Vec<geocode::Feature> = serde_json::from_slice(&std::fs::read(&out)?)?;
             let metric = graph::grid::Metric {
                 m_per_deg_lon: graph::haversine((0.0, 30.72), (1.0, 30.72)),
                 m_per_deg_lat: graph::haversine((0.0, 30.22), (0.0, 31.22)),

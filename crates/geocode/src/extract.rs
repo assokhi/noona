@@ -39,19 +39,23 @@ fn sector_from(tags: &HashMap<&str, &str>) -> Option<Sector> {
     None
 }
 
-fn feature_from(
-    tags: &HashMap<&str, &str>,
-    lon: f64,
-    lat: f64,
-) -> Option<Feature> {
+fn feature_from(tags: &HashMap<&str, &str>, lon: f64, lat: f64) -> Option<Feature> {
     let name = tags.get("name")?.trim();
     if name.is_empty() {
         return None;
     }
     // The kind is whichever classifying tag is present, most specific first.
     let (kind, value) = [
-        "amenity", "shop", "tourism", "leisure", "office", "healthcare", "aeroway", "railway",
-        "place", "building",
+        "amenity",
+        "shop",
+        "tourism",
+        "leisure",
+        "office",
+        "healthcare",
+        "aeroway",
+        "railway",
+        "place",
+        "building",
     ]
     .iter()
     .find_map(|k| tags.get(k).map(|v| (*k, *v)))?;
@@ -124,7 +128,11 @@ pub fn from_pbf(path: &Path) -> osmpbf::Result<Vec<Feature>> {
     })?;
 
     for w in &ways {
-        let pts: Vec<(f64, f64)> = w.refs.iter().filter_map(|r| coords.get(r).copied()).collect();
+        let pts: Vec<(f64, f64)> = w
+            .refs
+            .iter()
+            .filter_map(|r| coords.get(r).copied())
+            .collect();
         if pts.is_empty() {
             continue;
         }
