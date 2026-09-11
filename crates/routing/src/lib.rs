@@ -387,7 +387,13 @@ impl Search {
         (best_node != UNREACHED).then(|| self.build_route(g, sources, best, best_node, stats))
     }
 
-    pub fn alt(&mut self, g: &Graph, lm: &alt::Landmarks, source: u32, target: u32) -> Option<Route> {
+    pub fn alt(
+        &mut self,
+        g: &Graph,
+        lm: &alt::Landmarks,
+        source: u32,
+        target: u32,
+    ) -> Option<Route> {
         self.alt_multi(g, lm, &[(source, 0)], &[(target, 0)])
     }
 
