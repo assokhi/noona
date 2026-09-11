@@ -117,11 +117,7 @@ fn shortcuts_for(
     for a in &ins {
         // The longest hop out of v bounds every witness search from this u, so
         // one Dijkstra per incoming arc covers all its partners.
-        let max_out = outs
-            .iter()
-            .filter(|b| b.to != a.to)
-            .map(|b| b.weight)
-            .max();
+        let max_out = outs.iter().filter(|b| b.to != a.to).map(|b| b.weight).max();
         let Some(max_out) = max_out else { continue };
         stats.witness_searches += 1;
         w.run(
@@ -595,7 +591,8 @@ impl Search {
                         meet = u;
                     }
                 }
-                for i in ch.up_offsets[u as usize] as usize..ch.up_offsets[u as usize + 1] as usize {
+                for i in ch.up_offsets[u as usize] as usize..ch.up_offsets[u as usize + 1] as usize
+                {
                     stats.edges_relaxed += 1;
                     let (v, nd) = (ch.up_head[i], d.saturating_add(ch.up_weight[i]));
                     if nd < self.dist[v as usize] {
