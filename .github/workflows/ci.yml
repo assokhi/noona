@@ -8,10 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: never
 
-# contents: write only so a failed run can publish its own log to the
-# `ci-logs` branch. Job logs need a token to read via the API; the raw file
-# on that branch does not, which is what makes CI usable as the build loop
-# from a machine that cannot run the toolchain.
+# contents: write for two things: pushing rustfmt's result back, and publishing
+# the run log to the `ci-logs` branch. Job logs need a token to read via the
+# API; a raw file on a branch does not. That is what makes CI usable as the
+# build loop from a machine that cannot run the toolchain.
 permissions:
   contents: write
 
@@ -24,7 +24,7 @@ jobs:
       # ubuntu-latest ships a stable rust with cargo, clippy and rustfmt, so
       # there is no third-party toolchain action to trust here.
       - name: toolchain
-        run: rustc -Vv && cargo clippy --version && cargo fmt --version
+        run: rustc -Vv | tee ci.log && cargo clippy --version && cargo fmt --version
 
       # The dev box cannot run rustfmt (Smart App Control blocks the toolchain),
       # so CI applies it and pushes the result back. [skip ci] stops the loop.
@@ -33,11 +33,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cargo fmt --all
-          if ! git diff --quiet; then
+          set -o pipefail
+          echo "== rustfmt ==" >> ci.log
+          cargo fmt --all 2>&1 | tee -a ci.log
+          if ! git diff --quiet -- '*.rs'; then
             git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qam "rustfmt [skip ci]"
             git push -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"
-            echo "pushed a rustfmt commit - git pull before your next push"
+            echo "pushed a rustfmt commit - git pull before your next push" | tee -a ci.log
           fi
 
       - uses: actions/setup-python@v5
@@ -53,15 +55,21 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          make ci 2>&1 | tee ci.log
+          echo "== make ci ==" >> ci.log
+          make ci 2>&1 | tee -a ci.log
 
+      # Always, so a success is a readable file too and the poller never needs
+      # the API. ci.log may be missing if checkout itself failed.
       - name: publish log
-        if: failure()
+        if: always()
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUTCOME: ${{ job.status }}
         run: |
           short=${GITHUB_SHA::7}
+          touch ci.log
+          echo "== outcome: $OUTCOME ==" >> ci.log
           mkdir -p /tmp/logs
           cp ci.log /tmp/logs/last.log
           cp ci.log "/tmp/logs/$short.log"
@@ -69,4 +77,4 @@ jobs:
           git init -q && git checkout -qb ci-logs && git add .
           git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "ci log for $short"
           git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-logs
-          echo "log published: https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/ci-logs/$short.log"
+          echo "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/ci-logs/$short.log"

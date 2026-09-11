@@ -220,5 +220,3 @@ pub fn twins_agree(g: &Graph, c: &Chain) -> bool {
 pub fn contractible_at(g: &Graph, v: u32) -> bool {
     g.node_flags[v as usize] == 0 && chain_at(g, v).is_some_and(|c| twins_agree(g, &c))
 }
-
-/// Polyline endpoints are stored as the node coordinate narrowed to f32, so

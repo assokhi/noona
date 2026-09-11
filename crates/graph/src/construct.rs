@@ -314,7 +314,10 @@ impl Graph {
             Vec::new(),
         )
     }
+}
 
+/// Polyline endpoints are stored as the node coordinate narrowed to f32, so
+/// this compares exactly rather than with a tolerance.
 pub(crate) fn node_point(g: &Graph, v: u32) -> [f32; 2] {
     [g.lon[v as usize] as f32, g.lat[v as usize] as f32]
 }

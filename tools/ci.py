@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Watch the GitHub Actions run for a commit and print what failed.
+"""Wait for CI on a commit and print what mattered from its log.
 
-usage: ci.py [sha-or-branch] [--wait]
+usage: ci.py [sha-or-branch] [--full]
 
-Needs no token. Job logs do, so the workflow publishes its own log to the
-`ci-logs` branch on failure and this reads that raw file instead.
+Uses no GitHub API at all: the workflow publishes every run's log to the
+`ci-logs` branch and this polls the raw file, which has no meaningful rate
+limit. Exits 0 on success, 1 on failure, 2 if no log turned up in 20 minutes.
 """
-import json
 import re
 import subprocess
 import sys
@@ -16,70 +16,48 @@ import urllib.request
 REPO = "assokhi/noona"
 INTERESTING = re.compile(
     r"^(error|warning)(\[E\d+\])?[:\[]|-->|panicked|FAILED|assertion|MISMATCH|test result|"
-    r"contraction moved|does not run from|is a gate"
+    r"contraction moved|does not run from|is a gate|pushed a rustfmt|Diff in"
 )
-
-
-def api(path):
-    req = urllib.request.Request(f"https://api.github.com{path}")
-    req.add_header("Accept", "application/vnd.github+json")
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read())
-
-
-def fetch_log(sha):
-    url = f"https://raw.githubusercontent.com/{REPO}/ci-logs/{sha[:7]}.log"
-    for _ in range(12):
-        try:
-            with urllib.request.urlopen(url, timeout=60) as r:
-                return url, r.read().decode(errors="replace")
-        except Exception:  # noqa: BLE001
-            time.sleep(10)
-    return url, None
 
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    wait = "--wait" in sys.argv
     ref = args[0] if args else "HEAD"
     sha = subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+    url = f"https://raw.githubusercontent.com/{REPO}/ci-logs/{sha[:7]}.log"
 
-    run = None
-    for _ in range(90):
-        runs = api(f"/repos/{REPO}/actions/runs?head_sha={sha}&per_page=5")["workflow_runs"]
-        if runs:
-            run = runs[0]
-            if not wait or run["status"] == "completed":
-                break
-            print(f"  {run['status']} ...", flush=True)
-        else:
-            print("  no run yet ...", flush=True)
-        time.sleep(20)
-    if not run:
-        print(f"no run found for {sha[:7]}")
+    text = None
+    for i in range(80):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                text = r.read().decode(errors="replace")
+            break
+        except Exception:  # noqa: BLE001
+            if i % 4 == 0:
+                print(f"  waiting for {sha[:7]} ...", flush=True)
+            time.sleep(15)
+    if text is None:
+        print(f"no log after 20 minutes: {url}")
         return 2
 
-    print(f"{sha[:7]} {run['head_branch']} -> {run['status']} / {run['conclusion']}")
-    for job in api(f"/repos/{REPO}/actions/runs/{run['id']}/jobs")["jobs"]:
-        for s in job["steps"]:
-            if s["conclusion"] not in ("success", "skipped", None):
-                print(f"  {s['conclusion'].upper()} at step: {s['name']}")
-    if run["conclusion"] == "success":
-        return 0
-
-    url, text = fetch_log(sha)
-    if text is None:
-        print(f"no published log at {url}")
-        return 1
+    m = re.search(r"== outcome: (\w+) ==", text)
+    outcome = m.group(1) if m else "unknown"
     lines = text.splitlines()
-    keep = []
-    for i, ln in enumerate(lines):
-        if INTERESTING.search(ln):
-            keep.extend(lines[i : i + 6])
-            keep.append("")
-    print(f"--- {url} ({len(lines)} lines, showing {min(len(keep), 220)}) ---")
-    print("\n".join(keep[:220]))
-    return 1
+    print(f"{sha[:7]} -> {outcome}   ({len(lines)} log lines)  {url}")
+    if "--full" in sys.argv:
+        print(text)
+    elif outcome != "success":
+        keep = []
+        for i, ln in enumerate(lines):
+            if INTERESTING.search(ln):
+                keep.extend(lines[i : i + 7])
+                keep.append("")
+        print("\n".join(keep[:260]))
+    else:
+        for ln in lines:
+            if re.search(r"test result|pushed a rustfmt|fixture clip|release-assert:", ln):
+                print("  " + ln.strip())
+    return 0 if outcome == "success" else 1
 
 
 if __name__ == "__main__":
