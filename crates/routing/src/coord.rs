@@ -99,6 +99,10 @@ fn source_seeds(g: &Graph, s: &Snap) -> Vec<Seed> {
 }
 
 /// Nodes a search may *arrive at* and still reach this snap point legally.
+pub fn target_seeds_for(g: &Graph, s: &Snap) -> Vec<Seed> {
+    target_seeds(g, s)
+}
+
 fn target_seeds(g: &Graph, s: &Snap) -> Vec<Seed> {
     let e = s.edge as usize;
     if at_head(g, s) {

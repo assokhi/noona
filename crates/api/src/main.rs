@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use graph::grid::{Grid, Metric, Snap};
 use graph::Graph;
@@ -154,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/nearest", get(nearest))
         .route("/v1/route", get(route))
         .route("/v1/isochrone", get(isochrone))
+        .route("/v1/match", post(match_points))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .layer(TraceLayer::new_for_http())
@@ -356,6 +357,105 @@ async fn route_inner(s: &AppState, q: HashMap<String, String>) -> Result<Value, 
                 "way_name": s.graph.name(r.to.edge as usize),
             },
         },
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct MatchBody {
+    /// `[lon, lat, timestamp_ms]` triples, in order. Accuracy is optional and
+    /// comes as a fourth element when the device reported one.
+    points: Vec<Vec<f64>>,
+}
+
+/// HMM map matching over a GPS trace.
+async fn match_points(
+    State(s): State<Shared>,
+    Json(body): Json<MatchBody>,
+) -> Result<Json<Value>, ApiError> {
+    let t0 = Instant::now();
+    let out = match_inner(&s, body).await;
+    s.metrics.request(
+        "/v1/match",
+        out.as_ref().map_or_else(|e| e.status().as_u16(), |_| 200),
+        t0.elapsed().as_secs_f64(),
+    );
+    out.map(Json)
+}
+
+async fn match_inner(s: &AppState, body: MatchBody) -> Result<Value, ApiError> {
+    let Some(ch) = s.ch.as_deref() else {
+        // Transition probabilities need a route distance per candidate pair,
+        // which is thousands of shortest paths. Without CH this would not
+        // answer in a request.
+        return Err(ApiError::UnknownAlgorithm {
+            got: "match (needs ch.bin for transition probabilities)".into(),
+        });
+    };
+    let mut trace = Vec::with_capacity(body.points.len());
+    for (i, p) in body.points.iter().enumerate() {
+        let (&lon, &lat) = (
+            p.first().ok_or_else(|| ApiError::MalformedCoordinate {
+                detail: format!("point {i} is empty"),
+            })?,
+            p.get(1).ok_or_else(|| ApiError::MalformedCoordinate {
+                detail: format!("point {i} has no latitude"),
+            })?,
+        );
+        check_range(lon, lat)?;
+        trace.push(routing::matching::Fix {
+            at: (lon, lat),
+            timestamp_ms: p.get(2).copied().unwrap_or((i * 1000) as f64) as i64,
+            accuracy_m: p.get(3).copied(),
+        });
+    }
+    if trace.len() < 2 {
+        return Err(ApiError::MalformedCoordinate {
+            detail: "a trace needs at least two points".into(),
+        });
+    }
+
+    let params = routing::matching::Params::default();
+    let (mut lease, waited) = s.pool.acquire().await;
+    s.metrics.pool_wait(waited.as_secs_f64());
+    let started = Instant::now();
+    let r = lease.with(|search| {
+        routing::matching::match_trace(search, &s.graph, &s.grid, ch, &trace, params)
+    });
+    let match_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    let geometry: Vec<Value> = r
+        .edges
+        .iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            s.graph
+                .geometry(*e as usize)
+                .skip(usize::from(i > 0))
+                .map(|p| json!([round6(p[0] as f64), round6(p[1] as f64)]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    Ok(json!({
+        "matched_geometry": { "type": "LineString", "coordinates": geometry },
+        // Mean offset is the honest confidence signal: it is how far the fixes
+        // sat from the road the matcher chose.
+        "confidence": {
+            "mean_offset_m": round1(r.mean_offset_m),
+            "matched": r.matched,
+            "unmatched": r.unmatched,
+            "segments": r.segments,
+            "collapsed_stationary": r.collapsed,
+        },
+        "snapped_points": r.points.iter().map(|m| json!({
+            "fix": m.fix,
+            "segment": m.segment,
+            "snapped": m.snap.map(|s| json!([round6(s.point.0), round6(s.point.1)])),
+            "edge_id": m.snap.map(|s| s.edge),
+            "offset_m": m.snap.map(|s| round1(s.distance_m)),
+            "way_name": m.snap.and_then(|snap| s.graph.name(snap.edge as usize)),
+        })).collect::<Vec<_>>(),
+        "debug": { "match_ms": round3(match_ms), "fixes": trace.len() },
     }))
 }
 

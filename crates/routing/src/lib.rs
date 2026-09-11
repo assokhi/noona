@@ -13,6 +13,7 @@ pub mod alt;
 pub mod ch;
 pub mod coord;
 pub mod isochrone;
+pub mod matching;
 
 use graph::Graph;
 use std::cmp::Reverse;
