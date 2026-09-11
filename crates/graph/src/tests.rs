@@ -3,7 +3,6 @@ use crate::contract::contract;
 use crate::topology::{chain_at, scc, shape_at, Shape};
 use crate::*;
 
-
 #[test]
 fn haversine_known_distance() {
     // Sector 17 Plaza to Sukhna Lake, about 3 km apart.
@@ -199,4 +198,3 @@ fn an_asymmetric_node_is_not_a_chain() {
     assert_eq!(chain_at(&g, 1), None);
     assert_eq!(shape_at(&g, 1), Shape::Junction);
 }
-

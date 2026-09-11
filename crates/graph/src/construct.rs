@@ -325,7 +325,11 @@ pub(crate) fn node_point(g: &Graph, v: u32) -> [f32; 2] {
 /// Identity of a directed edge as a physical piece of road.
 pub(crate) type EdgeShape = (u32, u32, Vec<(u32, u32)>);
 
-pub(crate) fn shape_key<'a>(src: u32, dst: u32, points: impl Iterator<Item = &'a [f32; 2]>) -> EdgeShape {
+pub(crate) fn shape_key<'a>(
+    src: u32,
+    dst: u32,
+    points: impl Iterator<Item = &'a [f32; 2]>,
+) -> EdgeShape {
     (
         src,
         dst,

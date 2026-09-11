@@ -11,9 +11,9 @@ pub mod construct;
 pub mod contract;
 pub mod grid;
 pub mod io;
-pub mod topology;
 #[cfg(test)]
 mod tests;
+pub mod topology;
 
 pub use construct::{build, BuildStats};
 pub use contract::{contract, contractible_at, twins_agree, ContractStats};
