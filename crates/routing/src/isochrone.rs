@@ -119,7 +119,9 @@ pub fn concave_hull(points: &[(f64, f64)], alpha_m: f64, m: &Metric) -> Vec<(f64
         let pick = (0..xy.len())
             .filter(|c| !used[*c])
             .map(|c| (c, dist(a, c) + dist(c, b)))
-            .filter(|(c, sum)| *sum < longest.1 * 2.0 && dist(a, *c) < longest.1 && dist(*c, b) < longest.1)
+            .filter(|(c, sum)| {
+                *sum < longest.1 * 2.0 && dist(a, *c) < longest.1 && dist(*c, b) < longest.1
+            })
             .min_by(|x, y| x.1.total_cmp(&y.1));
         let Some((c, _)) = pick else { break };
         used[c] = true;
@@ -131,7 +133,12 @@ pub fn concave_hull(points: &[(f64, f64)], alpha_m: f64, m: &Metric) -> Vec<(f64
 /// Andrew's monotone chain, returning indices counter-clockwise.
 fn convex_hull(xy: &[(f64, f64)]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..xy.len()).collect();
-    order.sort_by(|a, b| xy[*a].0.total_cmp(&xy[*b].0).then(xy[*a].1.total_cmp(&xy[*b].1)));
+    order.sort_by(|a, b| {
+        xy[*a]
+            .0
+            .total_cmp(&xy[*b].0)
+            .then(xy[*a].1.total_cmp(&xy[*b].1))
+    });
     let cross = |o: usize, a: usize, b: usize| -> f64 {
         (xy[a].0 - xy[o].0) * (xy[b].1 - xy[o].1) - (xy[a].1 - xy[o].1) * (xy[b].0 - xy[o].0)
     };
@@ -164,7 +171,11 @@ mod tests {
         let g = crate::tests::grid_graph();
         let mut s = Search::new(g.n_nodes());
         let all = s.within_budget(&g, &[(0, 0)], u32::MAX / 2);
-        assert_eq!(all.len(), g.n_nodes(), "an infinite budget reaches the graph");
+        assert_eq!(
+            all.len(),
+            g.n_nodes(),
+            "an infinite budget reaches the graph"
+        );
 
         let near = s.within_budget(&g, &[(0, 0)], 2000);
         assert!(near.len() < all.len());
@@ -179,7 +190,10 @@ mod tests {
         for v in 0..g.n_nodes() as u32 {
             if let Some(r) = s.dijkstra(&g, 0, v) {
                 if r.cost_ms <= 2000 {
-                    assert!(reached.contains(&v), "node {v} within budget but not reached");
+                    assert!(
+                        reached.contains(&v),
+                        "node {v} within budget but not reached"
+                    );
                 }
             }
         }
