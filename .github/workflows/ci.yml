@@ -6,7 +6,14 @@ on:
   pull_request:
 
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
+
+# contents: write only so a failed run can publish its own log to the
+# `ci-logs` branch. Job logs need a token to read via the API; the raw file
+# on that branch does not, which is what makes CI usable as the build loop
+# from a machine that cannot run the toolchain.
+permissions:
+  contents: write
 
 jobs:
   check:
@@ -15,11 +22,23 @@ jobs:
       - uses: actions/checkout@v4
 
       # ubuntu-latest ships a stable rust with cargo, clippy and rustfmt, so
-      # there is no third-party toolchain action to trust here. Local dev uses
-      # stable-x86_64-pc-windows-gnullvm with portable llvm-mingw as the
-      # linker; this job is the evidence the project builds off that machine.
+      # there is no third-party toolchain action to trust here.
       - name: toolchain
         run: rustc -Vv && cargo clippy --version && cargo fmt --version
+
+      # The dev box cannot run rustfmt (Smart App Control blocks the toolchain),
+      # so CI applies it and pushes the result back. [skip ci] stops the loop.
+      - name: rustfmt
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo fmt --all
+          if ! git diff --quiet; then
+            git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qam "rustfmt [skip ci]"
+            git push -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"
+            echo "pushed a rustfmt commit - git pull before your next push"
+          fi
 
       - uses: actions/setup-python@v5
         with:
@@ -31,4 +50,23 @@ jobs:
       # is what keeps the Makefile from rotting. The assert target builds under
       # release-assert, which is the only place the debug-only assertions run.
       - name: make ci
-        run: make ci
+        shell: bash
+        run: |
+          set -o pipefail
+          make ci 2>&1 | tee ci.log
+
+      - name: publish log
+        if: failure()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          short=${GITHUB_SHA::7}
+          mkdir -p /tmp/logs
+          cp ci.log /tmp/logs/last.log
+          cp ci.log "/tmp/logs/$short.log"
+          cd /tmp/logs
+          git init -q && git checkout -qb ci-logs && git add .
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "ci log for $short"
+          git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-logs
+          echo "log published: https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/ci-logs/$short.log"
