@@ -430,7 +430,11 @@ mod tests {
             },
         ];
         let r = match_trace(&mut s, &g, &grid, &ch, &trace, Params::default());
-        assert!(r.segments >= 2, "expected a break, got {} segment", r.segments);
+        assert!(
+            r.segments >= 2,
+            "expected a break, got {} segment",
+            r.segments
+        );
         assert_ne!(
             r.points[1].segment, r.points[2].segment,
             "the gap should start a new segment"
