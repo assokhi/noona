@@ -16,8 +16,10 @@ it ran on.
 Three things, in three shells. Windows or Linux; nothing here needs `make`.
 
 ```sh
-# 1. build the graph (once; needs data/raw/chandigarh.osm.pbf - see Data below)
-cargo run -p graph --release -- build
+# 1. build the graph, then the two preprocessed structures (once each)
+cargo run -p graph --release -- build          # data/build/graph.bin
+cargo run -p bench  --release -- landmarks     # data/build/landmarks.bin, for ALT
+cargo run -p bench  --release -- ch            # data/build/ch.bin, for CH
 
 # 2. the API on :8080
 cargo run -p api --release -- --addr 127.0.0.1:8080 --pool 16
@@ -25,6 +27,14 @@ cargo run -p api --release -- --addr 127.0.0.1:8080 --pool 16
 # 3. the map on http://localhost:5173
 cd web && npm install && npm run dev
 ```
+
+The API runs without `landmarks.bin` or `ch.bin`; it refuses `alg=alt` or
+`alg=ch` rather than quietly answering with a different algorithm.
+
+If you cannot run `cargo` locally, the `binaries` workflow builds
+`graph.exe`, `bench.exe` and `api.exe` on every push and uploads them as a
+workflow artifact. Download, unzip, and use them in place of the
+`cargo run -p X --release --` prefixes above.
 
 Open <http://localhost:5173>, click an origin, click a destination. The panel
 shows nodes settled, edges relaxed and timings for the algorithm you pick;
@@ -51,7 +61,8 @@ benchmark uses - *is* committed.
 ```
 crates/osm-parse    .osm.pbf -> way records; knows about OSM tags, not graphs
 crates/graph        CSR graph: construct, contract, topology, io, grid (snapping)
-crates/routing      Dijkstra, A*, bidirectional; seeded search; coordinate routing
+crates/routing      Dijkstra, A*, bidirectional, ALT, CH; isochrones;
+                    seeded search; coordinate routing
 crates/api          axum server: /v1/route, /v1/nearest, /healthz, /metrics
 tools/bench         OD generation and the correctness + latency gates
 tools/*.sh, *.py    data pipeline, fixture, CI helpers
@@ -70,6 +81,7 @@ cargo test --workspace
 cargo run -p bench --release -- run --alg dijkstra,astar,bidir --reference dijkstra
 cargo run -p bench --release -- snap     # grid vs brute-force nearest edge
 cargo run -p bench --release -- coord    # coordinate routing vs node routing
+cargo run -p bench --release -- run --alg dijkstra,astar,bidir,alt,ch --reference dijkstra
 bash tools/assert.sh                     # debug-only assertions, forced on in release
 python tools/http_bench.py               # same pairs over HTTP; needs the API running
 ```

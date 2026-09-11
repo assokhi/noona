@@ -75,6 +75,10 @@ impl CoordRoute {
 /// Seeding both ends of a two-way edge permits an immediate U-turn at the snap
 /// point, which is accepted for now - Phase 8 turn restrictions is where that
 /// gets revisited.
+pub fn source_seeds_for(g: &Graph, s: &Snap) -> Vec<Seed> {
+    source_seeds(g, s)
+}
+
 fn source_seeds(g: &Graph, s: &Snap) -> Vec<Seed> {
     let e = s.edge as usize;
     // The snap landed on a junction rather than mid-edge. Then the endpoint is

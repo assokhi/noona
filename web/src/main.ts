@@ -2,7 +2,7 @@ import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import * as pmtiles from "pmtiles";
 
-import { ApiError, BBOX, fromGeolocation, lonLat, route } from "./api";
+import { ApiError, BBOX, fromGeolocation, isochrone, lonLat, route } from "./api";
 import type { Alg, LonLat, RouteResponse } from "./api";
 import { ConstantVelocity } from "./kalman";
 
@@ -93,6 +93,34 @@ map.on("load", () => {
   map.addSource("pins", { type: "geojson", data: emptyFC() });
   map.addSource("me", { type: "geojson", data: emptyFC() });
   map.addSource("me-raw", { type: "geojson", data: emptyFC() });
+  map.addSource("iso", { type: "geojson", data: emptyFC() });
+
+  // Under everything else: an isochrone is context, not the subject.
+  map.addLayer({
+    id: "iso-fill",
+    type: "fill",
+    source: "iso",
+    paint: {
+      "fill-color": [
+        "interpolate", ["linear"], ["get", "minutes"],
+        5, "#3ddc97", 10, "#ffd166", 20, "#ff6b6b",
+      ],
+      "fill-opacity": 0.16,
+    },
+  });
+  map.addLayer({
+    id: "iso-line",
+    type: "line",
+    source: "iso",
+    paint: {
+      "line-color": [
+        "interpolate", ["linear"], ["get", "minutes"],
+        5, "#3ddc97", 10, "#ffd166", 20, "#ff6b6b",
+      ],
+      "line-width": 1.5,
+      "line-opacity": 0.8,
+    },
+  });
 
   // Two layers, wide dark casing under a narrower bright line. A single line
   // disappears against the basemap's own road casings.
@@ -317,7 +345,24 @@ for (const el of document.querySelectorAll<HTMLButtonElement>("[data-alg]")) {
     if (origin && destination) void request();
   });
 }
+$("iso").addEventListener("click", async () => {
+  if (!origin) {
+    status("set an origin first, then ask for an isochrone", true);
+    return;
+  }
+  status("computing isochrone...");
+  try {
+    const r = await isochrone(origin, [5, 10, 15]);
+    setSource("iso", r as GeoJSON.FeatureCollection);
+    const bands = r.features.map((f) => `${f.properties.minutes} min`).join(", ");
+    status(`isochrone: ${bands} from ${r.debug.nodes_reached} nodes reached`);
+  } catch (err) {
+    status(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err), true);
+  }
+});
+
 $("clear").addEventListener("click", () => {
+  setSource("iso", emptyFC());
   origin = destination = null;
   for (const s of ["route", "snaps", "pins"]) setSource(s, emptyFC());
   renderDebug(null);

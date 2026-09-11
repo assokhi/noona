@@ -153,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/v1/nearest", get(nearest))
         .route("/v1/route", get(route))
+        .route("/v1/isochrone", get(isochrone))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .layer(TraceLayer::new_for_http())
@@ -353,6 +354,107 @@ async fn route_inner(s: &AppState, q: HashMap<String, String>) -> Result<Value, 
                 "distance_m": round1(r.to.distance_m),
                 "snapped": [round6(r.to.point.0), round6(r.to.point.1)],
                 "way_name": s.graph.name(r.to.edge as usize),
+            },
+        },
+    }))
+}
+
+/// Isochrone bands, outermost first so the smallest draws on top.
+async fn isochrone(
+    State(s): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let t0 = Instant::now();
+    let out = isochrone_inner(&s, &q).await;
+    s.metrics.request(
+        "/v1/isochrone",
+        out.as_ref().map_or_else(|e| e.status().as_u16(), |_| 200),
+        t0.elapsed().as_secs_f64(),
+    );
+    out.map(Json)
+}
+
+async fn isochrone_inner(s: &AppState, q: &HashMap<String, String>) -> Result<Value, ApiError> {
+    let num = |k: &str| -> Result<f64, ApiError> {
+        q.get(k)
+            .ok_or_else(|| ApiError::MalformedCoordinate {
+                detail: format!("missing {k}"),
+            })?
+            .parse()
+            .map_err(|_| ApiError::MalformedCoordinate {
+                detail: format!("{k} is not a number"),
+            })
+    };
+    let from = snap_point(s, "origin", num("lon")?, num("lat")?)?;
+    let mut minutes: Vec<f64> = q
+        .get("minutes")
+        .map(String::as_str)
+        .unwrap_or("5,10,15")
+        .split(',')
+        .map(|x| x.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| ApiError::MalformedCoordinate {
+            detail: "minutes must be a comma-separated list of numbers".into(),
+        })?;
+    minutes.retain(|m| *m > 0.0 && *m <= 120.0);
+    if minutes.is_empty() {
+        return Err(ApiError::MalformedCoordinate {
+            detail: "no usable values in minutes".into(),
+        });
+    }
+    minutes.sort_by(f64::total_cmp);
+
+    // On the plain graph on purpose: CH discards the search space, and here the
+    // search space is the answer.
+    let budget_ms = (minutes.last().copied().unwrap_or(0.0) * 60_000.0) as u32;
+    let seeds = routing::coord::source_seeds_for(&s.graph, &from);
+    let (mut lease, waited) = s.pool.acquire().await;
+    s.metrics.pool_wait(waited.as_secs_f64());
+    let search_start = Instant::now();
+    let reached = lease.with(|search| search.within_budget(&s.graph, &seeds, budget_ms));
+    let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
+    s.metrics.settled(reached.len() as u32);
+
+    // Outermost first so a client drawing in order puts the smallest on top.
+    let mut features = Vec::new();
+    for mins in minutes.iter().rev() {
+        let cut = (mins * 60_000.0) as u32;
+        let pts: Vec<(f64, f64)> = reached
+            .iter()
+            .filter(|r| r.cost_ms <= cut)
+            .map(|r| s.graph.coord(r.node))
+            .collect();
+        if pts.len() < 3 {
+            continue;
+        }
+        // Roughly how far a car covers in 45 s: small enough to bite into the
+        // gaps between arterials, large enough not to shred the boundary.
+        let alpha_m = 400.0;
+        let mut ring = routing::isochrone::concave_hull(&pts, alpha_m, &s.metric);
+        if let Some(first) = ring.first().copied() {
+            ring.push(first); // GeoJSON polygons close their ring
+        }
+        features.push(json!({
+            "type": "Feature",
+            "properties": { "minutes": mins, "nodes": pts.len() },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [ring.iter()
+                    .map(|p| json!([round6(p.0), round6(p.1)]))
+                    .collect::<Vec<_>>()],
+            },
+        }));
+    }
+
+    Ok(json!({
+        "type": "FeatureCollection",
+        "features": features,
+        "debug": {
+            "nodes_reached": reached.len(),
+            "search_ms": round3(search_ms),
+            "origin_snap": {
+                "distance_m": round1(from.distance_m),
+                "snapped": [round6(from.point.0), round6(from.point.1)],
             },
         },
     }))

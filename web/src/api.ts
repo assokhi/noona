@@ -110,3 +110,23 @@ export function nearest(at: LonLat): Promise<NearestResponse> {
   const q = new URLSearchParams({ lon: String(at[0]), lat: String(at[1]) });
   return get<NearestResponse>(`/v1/nearest?${q}`);
 }
+
+export interface IsochroneResponse {
+  type: "FeatureCollection";
+  features: Array<{
+    type: "Feature";
+    properties: { minutes: number; nodes: number };
+    geometry: { type: "Polygon"; coordinates: LonLat[][] };
+  }>;
+  debug: { nodes_reached: number; search_ms: number };
+}
+
+/** Bands come back outermost first, so drawing in order puts the smallest on top. */
+export function isochrone(at: LonLat, minutes: number[]): Promise<IsochroneResponse> {
+  const q = new URLSearchParams({
+    lon: String(at[0]),
+    lat: String(at[1]),
+    minutes: minutes.join(","),
+  });
+  return get<IsochroneResponse>(`/v1/isochrone?${q}`);
+}
