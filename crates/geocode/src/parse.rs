@@ -68,9 +68,21 @@ pub fn parse(query: &str) -> Address {
             } else {
                 (String::new(), 1)
             };
-            if let Some(s) = sector_token(&raw) {
-                out.sector = Some(s);
+            if let Some(mut s) = sector_token(&raw) {
                 i += consumed;
+                // "sector 17 c" spells the suffix as its own token.
+                if s.suffix.is_none() {
+                    if let Some(next) = tokens.get(i) {
+                        let t = next.trim_matches('-');
+                        if t.len() == 1 {
+                            if let Some(c) = t.chars().next().filter(|c| ('a'..='d').contains(c)) {
+                                s.suffix = Some(c.to_ascii_uppercase());
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                out.sector = Some(s);
                 continue;
             }
         }
