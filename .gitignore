@@ -1,5 +1,8 @@
 data/raw/*
 !data/raw/PROVENANCE
+# 2.7 MB. Committed so a fresh clone can build the graph and run every gate
+# without the 1.6 GB Geofabrik download. tools/data.sh regenerates it.
+!data/raw/chandigarh.osm.pbf
 data/build/*
 !data/build/od.json
 target/

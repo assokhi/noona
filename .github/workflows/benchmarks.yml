@@ -1,0 +1,87 @@
+name: benchmarks
+
+# The real numbers, on the real graph. The dev machine cannot run the toolchain
+# any more, and the fixture graph (653 nodes) is far too small to say anything
+# about CH, so this is where docs/benchmarks.md gets its figures.
+#
+# Latency here is a shared CI runner and is not comparable to the laptop numbers
+# already in that file. Nodes settled, shortcut counts and preprocessing times
+# are deterministic or near enough, and those are the numbers worth taking.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/benchmarks.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: machine
+        shell: bash
+        run: |
+          {
+            echo "== machine =="
+            grep -m1 "model name" /proc/cpuinfo || true
+            grep -m1 MemTotal /proc/meminfo || true
+            rustc --version
+          } | tee bench.log
+
+      - name: build graph
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo run -p graph --release -- build 2>&1 | tee -a bench.log
+
+      - name: preprocessing
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "== landmarks ==" >> bench.log
+          cargo run -p bench --release -- landmarks --k 16 2>&1 | tee -a bench.log
+          echo "== contraction hierarchy ==" >> bench.log
+          cargo run -p bench --release -- ch 2>&1 | tee -a bench.log
+
+      - name: gates
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "== snap vs brute force ==" >> bench.log
+          cargo run -p bench --release -- snap --n 1000 --seed 42 2>&1 | tee -a bench.log
+          echo "== coordinate vs node routing ==" >> bench.log
+          cargo run -p bench --release -- coord 2>&1 | tee -a bench.log
+
+      - name: all five algorithms
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "== node ends ==" >> bench.log
+          cargo run -p bench --release -- run \
+            --alg dijkstra,astar,bidir,alt,ch --reference dijkstra 2>&1 | tee -a bench.log
+          echo "== coordinate ends ==" >> bench.log
+          cargo run -p bench --release -- run \
+            --alg dijkstra,astar,bidir,alt,ch --reference dijkstra --coord 1 2>&1 | tee -a bench.log
+
+      - name: publish
+        if: always()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          echo "== outcome: $OUTCOME ==" >> bench.log
+          mkdir -p /tmp/logs && cp bench.log "/tmp/logs/bench-${GITHUB_SHA::7}.log"
+          cp bench.log /tmp/logs/bench-last.log
+          cd /tmp/logs
+          git init -q && git checkout -qb ci-logs && git add .
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "benchmarks for ${GITHUB_SHA::7}"
+          # Fetch first so this does not clobber the ci.yml logs on the branch.
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q origin ci-logs && git reset -q --soft origin/ci-logs && git add . \
+            && git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "benchmarks for ${GITHUB_SHA::7}" || true
+          git push -q origin HEAD:ci-logs
+          echo "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/ci-logs/bench-${GITHUB_SHA::7}.log"
