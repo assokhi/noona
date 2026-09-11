@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/osm-parse", "crates/graph", "crates/routing", "crates/api", "tools/bench"]
+members = ["crates/osm-parse", "crates/graph", "crates/routing", "crates/geocode", "crates/api", "tools/bench"]
 
 [workspace.package]
 version = "0.1.0"

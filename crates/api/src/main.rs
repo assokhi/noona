@@ -41,6 +41,8 @@ struct AppState {
     landmarks: Option<Arc<routing::alt::Landmarks>>,
     /// The contracted graph, if ch.bin was found.
     ch: Option<Arc<routing::ch::Ch>>,
+    /// The place index, if places.json was found.
+    places: Option<Arc<geocode::Index>>,
     metric: Metric,
     pool: Arc<Pool>,
     metrics: Metrics,
@@ -62,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut graph_path = PathBuf::from("data/build/graph.bin");
     let mut landmarks_path = PathBuf::from("data/build/landmarks.bin");
     let mut ch_path = PathBuf::from("data/build/ch.bin");
+    let mut places_path = PathBuf::from("data/build/places.json");
     let mut addr = "127.0.0.1:8080".to_string();
     let mut pool_size = std::thread::available_parallelism()
         .map_or(8, |n| n.get())
@@ -74,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--graph" => graph_path = PathBuf::from(v),
             "--landmarks" => landmarks_path = PathBuf::from(v),
             "--ch" => ch_path = PathBuf::from(v),
+            "--places" => places_path = PathBuf::from(v),
             "--addr" => addr = v.clone(),
             "--pool" => pool_size = v.parse()?,
             other => return Err(format!("unknown flag {other}").into()),
@@ -127,6 +131,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let places = match std::fs::read(&places_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<geocode::Feature>>(&b).ok())
+    {
+        Some(features) => {
+            tracing::info!(count = features.len(), "place index loaded");
+            Some(Arc::new(geocode::Index::build(features, metric)))
+        }
+        None => {
+            tracing::info!("no place index; /v1/geocode will be empty");
+            None
+        }
+    };
+
     let pool = Pool::new(pool_size, g.n_nodes());
     tracing::info!(
         nodes = g.n_nodes(),
@@ -144,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         grid: Arc::new(grid),
         landmarks,
         ch,
+        places,
         metric,
         pool,
         metrics: Metrics::default(),
@@ -155,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/route", get(route))
         .route("/v1/isochrone", get(isochrone))
         .route("/v1/match", post(match_points))
+        .route("/v1/geocode", get(geocode))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .layer(TraceLayer::new_for_http())
@@ -185,6 +205,7 @@ async fn healthz(State(s): State<Shared>) -> impl IntoResponse {
         "pool": s.pool.size,
         "landmarks": s.landmarks.as_ref().map(|l| l.count()),
         "ch_shortcuts": s.ch.as_ref().map(|c| c.n_shortcuts()),
+        "places": s.places.as_ref().map(|p| p.len()),
     }))
 }
 
@@ -456,6 +477,72 @@ async fn match_inner(s: &AppState, body: MatchBody) -> Result<Value, ApiError> {
             "way_name": m.snap.and_then(|snap| s.graph.name(snap.edge as usize)),
         })).collect::<Vec<_>>(),
         "debug": { "match_ms": round3(match_ms), "fixes": trace.len() },
+    }))
+}
+
+/// Address and place search.
+async fn geocode(
+    State(s): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let t0 = Instant::now();
+    let out = geocode_inner(&s, &q);
+    s.metrics.request(
+        "/v1/geocode",
+        out.as_ref().map_or_else(|e| e.status().as_u16(), |_| 200),
+        t0.elapsed().as_secs_f64(),
+    );
+    out.map(Json)
+}
+
+fn geocode_inner(s: &AppState, q: &HashMap<String, String>) -> Result<Value, ApiError> {
+    let text = q.get("q").map(String::as_str).unwrap_or("").trim();
+    if text.is_empty() {
+        return Err(ApiError::MalformedCoordinate {
+            detail: "missing q".into(),
+        });
+    }
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5)
+        .clamp(1, 50);
+    // Bias toward the map viewport when the client says where it is looking.
+    let near = match (q.get("lon"), q.get("lat")) {
+        (Some(lon), Some(lat)) => match (lon.parse::<f64>(), lat.parse::<f64>()) {
+            (Ok(lon), Ok(lat)) => {
+                check_range(lon, lat)?;
+                Some((lon, lat))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let parsed = geocode::parse(text);
+    let results = match &s.places {
+        Some(idx) => idx.search(text, limit, near),
+        None => Vec::new(),
+    };
+    Ok(json!({
+        "query": text,
+        // Surfacing what the grammar claimed makes a bad parse obvious rather
+        // than mysterious.
+        "parsed": {
+            "sector": parsed.sector.map(|x| x.to_string()),
+            "housenumber": parsed.housenumber,
+            "phase": parsed.phase,
+            "name": parsed.text,
+        },
+        "results": results.iter().map(|h| json!({
+            "name": h.feature.name,
+            "type": h.feature.kind,
+            "lon": round6(h.feature.lon),
+            "lat": round6(h.feature.lat),
+            "sector": h.feature.sector.map(|x| x.to_string()),
+            "housenumber": h.feature.housenumber,
+            "score": round3(h.score),
+        })).collect::<Vec<_>>(),
     }))
 }
 

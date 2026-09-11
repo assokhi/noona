@@ -1,4 +1,4 @@
-.PHONY: data graph stats landmarks ch bench snap coord serve apibench tiles web test fmt lint fixture assert ci
+.PHONY: data graph stats landmarks ch places bench snap coord serve apibench tiles web test fmt lint fixture assert ci
 CARGO ?= cargo
 
 ## Regenerate the Chandigarh extract. Local only - downloads 1.6 GB.
@@ -11,6 +11,8 @@ stats: ; @$(CARGO) run -p graph --release -- stats
 landmarks: ; @$(CARGO) run -p bench --release -- landmarks --k 16
 ## Build the contraction hierarchy.
 ch: ; @$(CARGO) run -p bench --release -- ch
+## Extract named features into the place index.
+places: ; @$(CARGO) run -p geocode --release -- build
 ## The correctness gate over the frozen OD set.
 bench: ; @$(CARGO) run -p bench --release -- run --alg dijkstra,astar,bidir,alt,ch --pairs data/build/od.json --reference dijkstra --json docs/bench-phase2.json
 ## Grid snapping against a brute-force scan of every edge.

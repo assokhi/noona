@@ -20,6 +20,7 @@ Three things, in three shells. Windows or Linux; nothing here needs `make`.
 cargo run -p graph --release -- build          # data/build/graph.bin
 cargo run -p bench  --release -- landmarks     # data/build/landmarks.bin, for ALT
 cargo run -p bench  --release -- ch            # data/build/ch.bin, for CH
+cargo run -p geocode --release -- build        # data/build/places.json, for search
 
 # 2. the API on :8080
 cargo run -p api --release -- --addr 127.0.0.1:8080 --pool 16
@@ -63,7 +64,9 @@ crates/osm-parse    .osm.pbf -> way records; knows about OSM tags, not graphs
 crates/graph        CSR graph: construct, contract, topology, io, grid (snapping)
 crates/routing      Dijkstra, A*, bidirectional, ALT, CH; isochrones;
                     seeded search; coordinate routing
-crates/api          axum server: /v1/route, /v1/nearest, /healthz, /metrics
+crates/geocode      Chandigarh address grammar and an in-memory place index
+crates/api          axum server: /v1/route, /v1/nearest, /v1/isochrone,
+                    /v1/match, /v1/geocode, /healthz, /metrics
 tools/bench         OD generation and the correctness + latency gates
 tools/*.sh, *.py    data pipeline, fixture, CI helpers
 web/                MapLibre + Vite, no framework

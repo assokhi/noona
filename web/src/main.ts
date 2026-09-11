@@ -2,7 +2,7 @@ import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import * as pmtiles from "pmtiles";
 
-import { ApiError, BBOX, fromGeolocation, isochrone, lonLat, route } from "./api";
+import { ApiError, BBOX, fromGeolocation, geocode, isochrone, lonLat, route } from "./api";
 import type { Alg, LonLat, RouteResponse } from "./api";
 import { ConstantVelocity } from "./kalman";
 
@@ -345,6 +345,55 @@ for (const el of document.querySelectorAll<HTMLButtonElement>("[data-alg]")) {
     if (origin && destination) void request();
   });
 }
+// --- search ----------------------------------------------------------------
+
+let searchTimer: number | undefined;
+$("q").addEventListener("input", () => {
+  const q = ($("q") as HTMLInputElement).value.trim();
+  window.clearTimeout(searchTimer);
+  if (q.length < 2) {
+    $("results").innerHTML = "";
+    return;
+  }
+  // Debounced: a keystroke per request would be a request per keystroke.
+  searchTimer = window.setTimeout(async () => {
+    try {
+      const c = map.getCenter();
+      const r = await geocode(q, lonLat(c.lng, c.lat));
+      $("results").innerHTML = r.results
+        .map(
+          (p, i) =>
+            `<div data-i="${i}">${p.name}<small>${p.type}${p.sector ? " &middot; " + p.sector : ""}</small></div>`,
+        )
+        .join("");
+      for (const el of $("results").querySelectorAll<HTMLElement>("div")) {
+        el.addEventListener("click", () => {
+          const p = r.results[Number(el.dataset.i)];
+          if (!p) return;
+          const at = lonLat(p.lon, p.lat);
+          // First click sets an origin, second a destination - same as the map.
+          if (!origin || destination) {
+            origin = at;
+            destination = null;
+            setSource("route", emptyFC());
+            renderDebug(null);
+          } else {
+            destination = at;
+          }
+          drawPins();
+          map.easeTo({ center: at, zoom: Math.max(map.getZoom(), 14) });
+          $("results").innerHTML = "";
+          ($("q") as HTMLInputElement).value = p.name;
+          if (origin && destination) void request();
+          else status(`origin: ${p.name}`);
+        });
+      }
+    } catch (err) {
+      status(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err), true);
+    }
+  }, 180);
+});
+
 $("iso").addEventListener("click", async () => {
   if (!origin) {
     status("set an origin first, then ask for an isochrone", true);

@@ -130,3 +130,34 @@ export function isochrone(at: LonLat, minutes: number[]): Promise<IsochroneRespo
   });
   return get<IsochroneResponse>(`/v1/isochrone?${q}`);
 }
+
+export interface Place {
+  name: string;
+  type: string;
+  lon: number;
+  lat: number;
+  sector: string | null;
+  housenumber: string | null;
+  score: number;
+}
+
+export interface GeocodeResponse {
+  query: string;
+  parsed: {
+    sector: string | null;
+    housenumber: string | null;
+    phase: number | null;
+    name: string;
+  };
+  results: Place[];
+}
+
+/** `near` biases results toward whatever the map is currently looking at. */
+export function geocode(q: string, near?: LonLat, limit = 6): Promise<GeocodeResponse> {
+  const p = new URLSearchParams({ q, limit: String(limit) });
+  if (near) {
+    p.set("lon", String(near[0]));
+    p.set("lat", String(near[1]));
+  }
+  return get<GeocodeResponse>(`/v1/geocode?${p}`);
+}

@@ -55,6 +55,31 @@
       }
       button:hover { border-color: #38424f; }
       button.on { background: var(--accent); color: #06120c; border-color: var(--accent); font-weight: 600; }
+      input {
+        width: 100%;
+        font: inherit;
+        color: var(--text);
+        background: #1a212b;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 8px;
+        margin-bottom: 6px;
+      }
+      input:focus { outline: none; border-color: var(--accent); }
+      #results:not(:empty) {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        margin-bottom: 8px;
+        overflow: hidden;
+      }
+      #results div {
+        padding: 5px 8px;
+        cursor: pointer;
+        border-bottom: 1px solid #1c232c;
+      }
+      #results div:last-child { border-bottom: 0; }
+      #results div:hover { background: #1f2733; }
+      #results small { color: var(--dim); display: block; }
       #status { margin-top: 10px; color: var(--dim); font-size: 12px; }
       #status.bad { color: #ff8080; }
       #debug > div {
@@ -77,6 +102,8 @@
     <div id="map"></div>
     <div id="panel">
       <h1>Chandigarh routing</h1>
+      <input id="q" placeholder="Sector 17 Plaza, PGIMER, sec 40&hellip;" autocomplete="off" />
+      <div id="results"></div>
       <div class="row">
         <button data-alg="dijkstra">dijkstra</button>
         <button data-alg="astar">A*</button>
