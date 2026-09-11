@@ -16,8 +16,9 @@ P=(cargo run --quiet --profile release-assert)
 "${P[@]}" -p graph -- build --pbf "$WORK/clip.osm.pbf" --out "$WORK/graph.bin"
 "${P[@]}" -p bench -- gen --n 100 --seed 42 --graph "$WORK/graph.bin" --out "$WORK/od.json"
 "${P[@]}" -p bench -- landmarks --k 8 --graph "$WORK/graph.bin" --landmarks "$WORK/lm.bin"
-"${P[@]}" -p bench -- run --alg dijkstra,astar,bidir,alt \
-  --graph "$WORK/graph.bin" --pairs "$WORK/od.json" --landmarks "$WORK/lm.bin" \
-  --reference dijkstra
+"${P[@]}" -p bench -- ch --graph "$WORK/graph.bin" --ch "$WORK/ch.bin"
+"${P[@]}" -p bench -- run --alg dijkstra,astar,bidir,alt,ch \
+  --graph "$WORK/graph.bin" --pairs "$WORK/od.json" \
+  --landmarks "$WORK/lm.bin" --ch "$WORK/ch.bin" --reference dijkstra
 
 echo "release-assert: fixture build and bench ran with assertions on"
