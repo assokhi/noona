@@ -1,6 +1,7 @@
 //! OSM ways -> CSR graph: junction detection, edge emission, largest SCC,
 //! and packing an edge list into the arrays.
 
+use crate::contract::{contract, ContractStats};
 use crate::topology::scc;
 use crate::{haversine, Graph, FLAG_GEOM_REVERSED, NODE_BARRIER, NODE_SIGNALS, NO_NAME, NO_TWIN};
 use osm_parse::{Oneway, Way};
