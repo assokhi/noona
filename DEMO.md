@@ -27,7 +27,7 @@ target\release\bench.exe ch             # ~0.3 s  -> data/build/ch.bin
 ```
 
 ```powershell
-targetelease\geocode.exe build        # ~0.1 s  -> data/build/places.json
+target\release\geocode.exe build        # ~0.1 s  -> data/build/places.json
 ```
 
 ## 3. Show the numbers
