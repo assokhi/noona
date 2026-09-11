@@ -3,13 +3,25 @@
 A self-hosted map and routing service for Chandigarh UT, built from
 OpenStreetMap data with the routing core written from scratch in Rust. No
 routing libraries: graph construction, Dijkstra, A\*, bidirectional search,
-snapping and the HTTP API are all in this repo. Rendering uses MapLibre with
-self-hosted PMTiles.
+ALT, contraction hierarchies, snapping, map matching, geocoding and the HTTP
+API are all in this repo. Rendering uses MapLibre with self-hosted PMTiles.
 
 The point is to learn how routing engines work, so every optimisation is gated
 by exact-cost equality against plain Dijkstra on 1000 fixed OD pairs, and every
 measurement lives in [docs/benchmarks.md](docs/benchmarks.md) with the machine
 it ran on.
+
+| Algorithm | Nodes settled (mean) | Work vs Dijkstra | Mismatches |
+|---|---|---|---|
+| Dijkstra | 21,103 | 1.00x | 0 |
+| A\* | 11,017 | 1.92x | 0 |
+| Bidirectional | 12,026 | 1.75x | 0 |
+| ALT, 16 landmarks | 1,273 | 16.57x | 0 |
+| **Contraction hierarchies** | **147** | **143.81x** | **0** |
+
+40,572 nodes, 103,658 edges. CH preprocesses in 0.3 s and adds 98,119
+shortcuts; 85.5% of the shortcuts its witness search considered turned out to be
+unnecessary and were skipped.
 
 ## Run it
 

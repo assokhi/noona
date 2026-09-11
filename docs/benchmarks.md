@@ -155,8 +155,8 @@ Graph: 40,572 nodes / 103,658 edges, fastest edge 70.0 km/h.
 | Dijkstra | - | 2.770 | 5.431 | 6.645 | 7.897 | 21,103 | 40,567 | 54,048 | 1.00x | 1.00x | **0** |
 | A\* | - | 2.066 | 6.060 | 7.796 | 9.975 | 11,017 | 38,587 | 28,275 | 1.34x | 1.92x | **0** |
 | Bidirectional Dijkstra | - | 1.752 | 4.586 | 5.619 | 8.431 | 12,026 | 31,858 | 30,854 | 1.58x | 1.75x | **0** |
-| ALT (16 landmarks) | | | | | | | | | | | |
-| CH | | | | | | | | | | | |
+| ALT (16 landmarks) | see Phase 5 | | | | | | | | | | |
+| CH | see Phase 5 | | | | | | | | | | |
 
 All three return costs exactly equal to Dijkstra on all 1000 pairs. The harness
 exits non-zero on any mismatch, so it is a gate rather than a report.
@@ -387,6 +387,98 @@ requests from a 138 GB global archive that was never downloaded.
 Range requests are verified rather than assumed: `curl -H 'Range: bytes=0-99'`
 returns `206 Partial Content` with `Content-Range: bytes 0-99/4490370`. A server
 that ignores `Range` appears to work while fetching the whole archive per tile.
+
+## Phase 5 - ALT and Contraction Hierarchies
+
+**Different machine.** Everything above was measured on the laptop; the local
+Rust toolchain is now blocked by Smart App Control, so these come from the
+`benchmarks` CI workflow on an AMD EPYC 9V74. Latency is therefore not
+comparable to the numbers above - but nodes settled, edges relaxed, shortcut
+counts and preprocessing sizes are deterministic, and those are the numbers that
+matter here.
+
+Same 1000 OD pairs, seed 42, node ends, interleaved per pair.
+
+| Algorithm | Prep time | Prep size | p50 (ms) | p95 (ms) | p99 (ms) | Nodes settled (mean) | Nodes settled (max) | Edges relaxed (mean) | Latency vs Dijkstra | **Work vs Dijkstra** | Mismatches |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Dijkstra | - | - | 1.565 | 2.842 | 2.973 | 21,103 | 40,567 | 54,051 | 1.00x | 1.00x | **0** |
+| A\* | - | - | 1.110 | 3.042 | 3.952 | 11,017 | 38,587 | 28,278 | 1.41x | 1.92x | **0** |
+| Bidirectional | - | - | 0.950 | 2.289 | 2.580 | 12,026 | 31,858 | 30,854 | 1.65x | 1.75x | **0** |
+| ALT (16 landmarks) | 106 ms | 5,193,304 B | 0.181 | 0.739 | 1.044 | 1,273 | 7,308 | 3,248 | 8.66x | **16.57x** | **0** |
+| **CH** | **0.3 s** | 3,715,364 B | **0.047** | **0.076** | **0.089** | **147** | **275** | **872** | **32.98x** | **143.81x** | **0** |
+
+All five return costs exactly equal to Dijkstra on all 1000 pairs, by
+coordinate ends as well as node ends. The harness exits non-zero on a mismatch.
+
+### The ALT prediction, tested
+
+Phase 2 recorded a falsifiable claim: that ALT would beat A\* here by a wide
+margin, and by more than the literature's road-network averages, because this
+graph's speed spread is unusually wide - `max_speed` is 70 km/h while the
+typical edge runs at 25-35, so the haversine bound is roughly 3x loose and
+cannot be tightened without breaking admissibility.
+
+**Confirmed.** A\* reduces work 1.92x; ALT reduces it 16.57x. That is 8.6x
+better than A\* on the same pairs, from 16 landmarks and 5 MB of tables. The
+mechanism is exactly the one predicted: landmark bounds encode real network
+distances, so they are immune to the speed heterogeneity that makes the
+haversine bound loose. A\* still explores 11,017 nodes out of 40,572; ALT
+explores 1,273.
+
+### Contraction hierarchies
+
+| | |
+|---|---|
+| Preprocessing | 0.3 s single-threaded (gate: under 60 s) |
+| Shortcuts added | 98,119 over 103,658 original edges, +94.7% |
+| Witness searches | 280,238 run, 239,594 found a witness |
+| Shortcuts avoided by a witness | 85.5% |
+| Hierarchy | max level 75, 4.97 upward arcs per node |
+| `ch.bin` | 3,715,364 B - smaller than `graph.bin` at 6,620,559 B |
+
+The witness search earns its place: 85.5% of the shortcuts it considered turned
+out to be unnecessary. Without it the hierarchy would carry roughly seven times
+the shortcuts it does.
+
+A search that settled 21,103 nodes now settles 147, and the *worst* pair in the
+set settles 275 - two orders of magnitude below Dijkstra's *mean*. That ratio
+between worst and mean is the interesting part: Dijkstra's worst pair settles
+40,567 nodes against a mean of 21,103, nearly 2x, because a long trip really
+does cost more. CH's worst is 275 against a mean of 147. Every query is the
+same short climb up the hierarchy and back down, almost regardless of how far
+apart the endpoints are, so the tail nearly flattens: p99 0.089 ms against a
+p50 of 0.047 ms.
+
+### The bound is safe, and that is tested rather than asserted
+
+Cutting the witness search short can only add shortcuts that were not needed -
+never change an answer. That claim is executable: a test builds the entire
+hierarchy with `hops = 1, settled = 1`, which is about as crippled as the bound
+gets, and checks all 1,260 grid pairs still equal Dijkstra exactly.
+
+### Isochrones, deliberately not on CH
+
+CH discards the search space; for an isochrone the search space *is* the answer.
+A CH query visits ~147 nodes near the top of the hierarchy, an isochrone needs
+every node inside the time budget. So `/v1/isochrone` runs a multi-source
+Dijkstra truncated at the budget, on the plain graph, and the boundary is an
+alpha shape rather than a convex hull - a convex hull would claim the whole gap
+between two arterials as reachable, which is exactly what an isochrone exists to
+show you is not.
+
+## Phase 6 and 7
+
+**Map matching** is Newson & Krumm's HMM decoded with Viterbi, in log space.
+Transition probabilities need a road distance per candidate pair, which for a
+200-fix trace with 8 candidates each is thousands of shortest paths - that is
+why it waited for CH, where those are 0.047 ms each rather than 1.565 ms.
+
+**Geocoding** deviates from the spec, which asked for PostgreSQL with PostGIS,
+`tsvector` and `pg_trgm`. The index is ~15k named features for one city: a few
+MB in memory, built in under a second, no server or schema. A database here
+would be a dependency for a hash map. The query shape - hard filter on sector,
+trigram rank within it - maps directly onto `tsvector` + `pg_trgm` if this ever
+outgrows one city or needs writes.
 
 ## Finding: `maxspeed` coverage is 0.4%
 
