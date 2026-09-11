@@ -36,6 +36,9 @@ const SNAP_RADIUS_M: f64 = 1000.0;
 struct AppState {
     graph: Arc<Graph>,
     grid: Arc<Grid>,
+    /// Present only if landmarks.bin was found. `alg=alt` is refused rather
+    /// than silently falling back when it is missing.
+    landmarks: Option<Arc<routing::alt::Landmarks>>,
     metric: Metric,
     pool: Arc<Pool>,
     metrics: Metrics,
@@ -55,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let mut graph_path = PathBuf::from("data/build/graph.bin");
+    let mut landmarks_path = PathBuf::from("data/build/landmarks.bin");
     let mut addr = "127.0.0.1:8080".to_string();
     let mut pool_size = std::thread::available_parallelism()
         .map_or(8, |n| n.get())
@@ -65,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let v = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--graph" => graph_path = PathBuf::from(v),
+            "--landmarks" => landmarks_path = PathBuf::from(v),
             "--addr" => addr = v.clone(),
             "--pool" => pool_size = v.parse()?,
             other => return Err(format!("unknown flag {other}").into()),
@@ -83,6 +88,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_lat = min_lat.min(p[1] as f64);
         max_lat = max_lat.max(p[1] as f64);
     }
+    // Optional: the server is useful without it, and a stale table is worse
+    // than none, so a hash mismatch is refused rather than tolerated.
+    let landmarks = match routing::alt::Landmarks::load(&landmarks_path) {
+        Ok((lm, hash)) if hash == source_hash => {
+            tracing::info!(count = lm.count(), "landmarks loaded");
+            Some(Arc::new(lm))
+        }
+        Ok(_) => {
+            tracing::warn!(
+                path = %landmarks_path.display(),
+                "landmarks were built for a different graph, ignoring them"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::info!("no landmarks ({e}); alg=alt will be refused");
+            None
+        }
+    };
+
     let pool = Pool::new(pool_size, g.n_nodes());
     tracing::info!(
         nodes = g.n_nodes(),
@@ -98,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state: Shared = Arc::new(AppState {
         graph: Arc::new(g),
         grid: Arc::new(grid),
+        landmarks,
         metric,
         pool,
         metrics: Metrics::default(),
@@ -135,6 +161,7 @@ async fn healthz(State(s): State<Shared>) -> impl IntoResponse {
         "nodes": s.graph.n_nodes(),
         "edges": s.graph.n_edges(),
         "pool": s.pool.size,
+        "landmarks": s.landmarks.as_ref().map(|l| l.count()),
     }))
 }
 
@@ -246,8 +273,14 @@ async fn route_inner(s: &AppState, q: HashMap<String, String>) -> Result<Value, 
     s.metrics.pool_wait(waited.as_secs_f64());
 
     let search_start = Instant::now();
-    let found =
-        lease.with(|search| routing::coord::route(search, &s.graph, &s.metric, from, to, alg));
+    if alg == routing::coord::Alg::Alt && s.landmarks.is_none() {
+        return Err(ApiError::UnknownAlgorithm {
+            got: "alt (no landmarks.bin loaded)".into(),
+        });
+    }
+    let lm = s.landmarks.as_deref();
+    let found = lease
+        .with(|search| routing::coord::route_with(search, &s.graph, &s.metric, lm, from, to, alg));
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
     let r = found.ok_or(ApiError::Unreachable)?;

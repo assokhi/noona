@@ -15,15 +15,20 @@ pub enum Alg {
     Dijkstra,
     Astar,
     Bidir,
+    /// A* with landmark bounds. Needs the landmark tables loaded.
+    Alt,
 }
 
 impl Alg {
+    /// Everything routable without extra preprocessing. ALT is excluded
+    /// because it needs landmark tables that may not be built.
     pub const ALL: [Alg; 3] = [Alg::Dijkstra, Alg::Astar, Alg::Bidir];
     pub fn name(self) -> &'static str {
         match self {
             Alg::Dijkstra => "dijkstra",
             Alg::Astar => "astar",
             Alg::Bidir => "bidir",
+            Alg::Alt => "alt",
         }
     }
 }
@@ -35,6 +40,7 @@ impl std::str::FromStr for Alg {
             "dijkstra" => Ok(Alg::Dijkstra),
             "astar" | "a*" => Ok(Alg::Astar),
             "bidir" | "bidirectional" => Ok(Alg::Bidir),
+            "alt" => Ok(Alg::Alt),
             _ => Err(()),
         }
     }
@@ -161,6 +167,20 @@ pub fn route(
     to: Snap,
     alg: Alg,
 ) -> Option<CoordRoute> {
+    route_with(search, g, m, None, from, to, alg)
+}
+
+/// As `route`, with landmark tables available. `Alg::Alt` needs them; every
+/// other algorithm ignores them.
+pub fn route_with(
+    search: &mut Search,
+    g: &Graph,
+    m: &Metric,
+    lm: Option<&crate::alt::Landmarks>,
+    from: Snap,
+    to: Snap,
+    alg: Alg,
+) -> Option<CoordRoute> {
     if let Some(r) = same_edge_route(g, &from, &to, m) {
         return Some(r);
     }
@@ -171,6 +191,12 @@ pub fn route(
         Alg::Dijkstra => search.dijkstra_multi(g, &sources, &targets),
         Alg::Astar => search.astar_multi(g, &sources, &targets, to.point),
         Alg::Bidir => search.bidirectional_multi(g, &sources, &targets),
+        Alg::Alt => search.alt_multi(
+            g,
+            lm.expect("Alg::Alt needs landmark tables; use route_with"),
+            &sources,
+            &targets,
+        ),
     }?;
 
     // The adjacent-edge trap: when the two snapped edges share a node, going

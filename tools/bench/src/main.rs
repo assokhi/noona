@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 const USAGE: &str = "usage: bench gen  [--n N] [--seed S] [--graph graph.bin] [--out od.json]\n\
                      \x20      bench run  [--alg a,b,c] [--pairs od.json] [--graph graph.bin] [--reference alg] [--json out.json]\n\
                      \x20      bench snap [--n N] [--seed S] [--graph graph.bin]\n\
-                     \x20      bench coord [--pairs od.json] [--graph graph.bin]";
+                     \x20      bench coord [--pairs od.json] [--graph graph.bin]\n\
+                     \x20      bench landmarks [--k 16] [--graph graph.bin] [--landmarks landmarks.bin]";
 
 /// Pairs are stored by OSM node id, not by internal index. Internal ids are
 /// dense positions that move whenever the graph is rebuilt; the point of a
@@ -71,6 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reference = "dijkstra".to_string();
     let mut json_out: Option<PathBuf> = None;
     let mut by_coord = false;
+    let mut landmarks_path = PathBuf::from("data/build/landmarks.bin");
+    let mut k = routing::alt::DEFAULT_LANDMARKS;
 
     let mut rest = args.iter();
     let Some(cmd) = rest.next() else {
@@ -89,6 +92,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--reference" => reference = v.clone(),
             "--json" => json_out = Some(PathBuf::from(v)),
             "--coord" => by_coord = v == "true" || v == "1",
+            "--landmarks" => landmarks_path = PathBuf::from(v),
+            "--k" => k = v.parse()?,
             other => return Err(format!("unknown flag {other}\n{USAGE}").into()),
         }
     }
@@ -102,9 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &reference,
             json_out.as_deref(),
             by_coord,
+            &landmarks_path,
         ),
         "snap" => snap(&graph_path, n, seed),
         "coord" => coord_gate(&graph_path, &pairs),
+        "landmarks" => landmarks(&graph_path, k, &landmarks_path),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -268,6 +275,25 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[i]
 }
 
+/// Build the landmark tables ALT routes on.
+fn landmarks(graph_path: &Path, k: usize, out: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let (g, hash) = Graph::load(graph_path)?;
+    let t0 = Instant::now();
+    let lm = routing::alt::Landmarks::build(&g, k);
+    let prep_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if let Some(p) = out.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    lm.save(out, hash)?;
+    let bytes = std::fs::metadata(out)?.len();
+    println!(
+        "{k} landmarks over {} nodes in {prep_ms:.0} ms, {bytes} bytes -> {}",
+        g.n_nodes(),
+        out.display()
+    );
+    Ok(())
+}
+
 /// Either end of the comparison: node ids, or the snapped coordinates the API
 /// actually serves. `--coord` makes the in-process baseline do exactly the work
 /// the HTTP handler does, so the difference between them is purely transport.
@@ -282,10 +308,12 @@ enum Ends {
 fn route(
     search: &mut Search,
     g: &Graph,
+    lm: Option<&routing::alt::Landmarks>,
     ends: &Ends,
     i: usize,
     alg: &str,
 ) -> Option<(u32, routing::SearchStats)> {
+    let need_lm = || lm.expect("alt needs landmarks: run `bench landmarks` first");
     match ends {
         Ends::Nodes(v) => {
             let (s, t) = v[i];
@@ -293,6 +321,7 @@ fn route(
                 "dijkstra" => search.dijkstra(g, s, t),
                 "astar" => search.astar(g, s, t),
                 "bidir" => search.bidirectional(g, s, t),
+                "alt" => search.alt(g, need_lm(), s, t),
                 other => panic!("unknown algorithm {other}"),
             };
             r.map(|r| (r.cost_ms, r.stats))
@@ -300,7 +329,8 @@ fn route(
         Ends::Coords(v, m) => {
             let (from, to) = v[i];
             let alg: routing::coord::Alg = alg.parse().expect("unknown algorithm");
-            routing::coord::route(search, g, m, from, to, alg).map(|r| (r.cost_ms, r.stats))
+            routing::coord::route_with(search, g, m, lm, from, to, alg)
+                .map(|r| (r.cost_ms, r.stats))
         }
     }
 }
@@ -313,8 +343,9 @@ fn run(
     reference: &str,
     json_out: Option<&Path>,
     by_coord: bool,
+    landmarks_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (g, _) = Graph::load(graph_path)?;
+    let (g, graph_hash) = Graph::load(graph_path)?;
     let set: PairSet = serde_json::from_slice(&std::fs::read(pairs_path)?)?;
 
     let index: HashMap<i64, u32> = g
@@ -349,6 +380,22 @@ fn run(
     let mut search = Search::new(g.n_nodes());
 
     // The reference costs every other algorithm must match exactly.
+    // Only loaded when something asks for it, so the other algorithms do not
+    // need preprocessing to exist.
+    let lm = if algs.split(',').any(|a| a.trim() == "alt") || reference == "alt" {
+        let (lm, lm_hash) = routing::alt::Landmarks::load(landmarks_path)?;
+        if lm_hash != graph_hash {
+            return Err(format!(
+                "{} was built for a different graph - rerun `bench landmarks`",
+                landmarks_path.display()
+            )
+            .into());
+        }
+        Some(lm)
+    } else {
+        None
+    };
+
     let ends = if by_coord {
         let grid = graph::grid::Grid::build(&g);
         let m = grid.metric();
@@ -369,7 +416,7 @@ fn run(
 
     let mut reference_cost: Vec<u32> = Vec::with_capacity(resolved.len());
     for i in 0..resolved.len() {
-        let (cost, _) = route(&mut search, &g, &ends, i, reference)
+        let (cost, _) = route(&mut search, &g, lm.as_ref(), &ends, i, reference)
             .ok_or_else(|| format!("reference {reference} found no route for pair {i}"))?;
         reference_cost.push(cost);
     }
@@ -377,7 +424,7 @@ fn run(
     // Warm up every algorithm first; these samples are thrown away.
     for alg in &names {
         for i in 0..resolved.len().min(50) {
-            let _ = route(&mut search, &g, &ends, i, alg);
+            let _ = route(&mut search, &g, lm.as_ref(), &ends, i, alg);
         }
     }
 
@@ -394,7 +441,7 @@ fn run(
             let a = (i + k) % names.len();
             // One query per timing sample, single threaded, monotonic clock.
             let start = Instant::now();
-            let r = route(&mut search, &g, &ends, i, names[a]);
+            let r = route(&mut search, &g, lm.as_ref(), &ends, i, names[a]);
             times[a].push(start.elapsed().as_secs_f64() * 1000.0);
             match r {
                 Some((cost_ms, stats)) => {

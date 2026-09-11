@@ -9,6 +9,7 @@
 //! they hold the endpoints of a snapped edge at their partial costs. Nothing is
 //! ever inserted into the graph.
 
+pub mod alt;
 pub mod coord;
 
 use graph::Graph;
@@ -270,6 +271,124 @@ impl Search {
             self.assert_admissible(g, sources, r, goal, per_m);
         }
         route
+    }
+
+    /// Full single-source Dijkstra, returning the dense distance array.
+    ///
+    /// `backward` walks the reverse graph, so the result is the cost *into*
+    /// `source` from every node. Landmark preprocessing needs both directions.
+    pub fn distances_from(&mut self, g: &Graph, source: u32, backward: bool) -> Vec<u32> {
+        self.reset();
+        let mut out = vec![UNREACHED; g.n_nodes()];
+        self.dist[source as usize] = 0;
+        self.touched.push(source);
+        self.heap.push(Reverse((0, source)));
+
+        while let Some(Reverse((d, u))) = self.heap.pop() {
+            if d > self.dist[u as usize] {
+                continue;
+            }
+            out[u as usize] = d;
+            if backward {
+                for j in g.in_edges(u) {
+                    let (e, v) = (g.r_edge[j], g.r_head[j]);
+                    self.relax(v, d + g.weight[e as usize], e);
+                }
+            } else {
+                for e in g.out_edges(u) {
+                    self.relax(g.head[e], d + g.weight[e], e as u32);
+                }
+            }
+        }
+        out
+    }
+
+    #[inline]
+    fn relax(&mut self, v: u32, nd: u32, via: u32) {
+        if nd < self.dist[v as usize] {
+            if self.dist[v as usize] == UNREACHED {
+                self.touched.push(v);
+            }
+            self.dist[v as usize] = nd;
+            self.parent[v as usize] = via;
+            self.heap.push(Reverse((nd, v)));
+        }
+    }
+
+    /// ALT: A* whose lower bound comes from landmark distances instead of a
+    /// speed assumption.
+    ///
+    /// The heuristic is `min over targets of (bound(v, t) + seed cost of t)`.
+    /// A minimum over admissible bounds is admissible, and each landmark bound
+    /// is consistent, so the search settles each node once exactly like A*.
+    pub fn alt_multi(
+        &mut self,
+        g: &Graph,
+        lm: &alt::Landmarks,
+        sources: &[Seed],
+        targets: &[Seed],
+    ) -> Option<Route> {
+        self.reset();
+        let mut stats = SearchStats::default();
+        let h = |cache: &mut Vec<u32>, v: u32| -> u32 {
+            if cache[v as usize] == UNREACHED {
+                cache[v as usize] = targets
+                    .iter()
+                    .map(|(t, tc)| lm.bound(v, *t).saturating_add(*tc))
+                    .min()
+                    .unwrap_or(0);
+            }
+            cache[v as usize]
+        };
+
+        for (v, c) in sources {
+            if *c < self.dist[*v as usize] {
+                if self.dist[*v as usize] == UNREACHED {
+                    self.touched.push(*v);
+                }
+                self.dist[*v as usize] = *c;
+                let hv = h(&mut self.h_cache, *v);
+                self.heap.push(Reverse((c.saturating_add(hv), *v)));
+            }
+        }
+
+        let (mut best, mut best_node) = (u32::MAX, UNREACHED);
+        while let Some(Reverse((f, u))) = self.heap.pop() {
+            let d = self.dist[u as usize];
+            if f > d.saturating_add(h(&mut self.h_cache, u)) {
+                continue; // stale
+            }
+            if f >= best {
+                break;
+            }
+            stats.nodes_settled += 1;
+            if let Some(tc) = seed_cost(targets, u) {
+                let total = d.saturating_add(tc);
+                if total < best {
+                    best = total;
+                    best_node = u;
+                }
+            }
+            for e in g.out_edges(u) {
+                stats.edges_relaxed += 1;
+                let v = g.head[e];
+                let nd = d + g.weight[e];
+                if nd < self.dist[v as usize] {
+                    if self.dist[v as usize] == UNREACHED {
+                        self.touched.push(v);
+                    }
+                    self.dist[v as usize] = nd;
+                    self.parent[v as usize] = e as u32;
+                    let hv = h(&mut self.h_cache, v);
+                    self.heap.push(Reverse((nd.saturating_add(hv), v)));
+                }
+            }
+        }
+        (best_node != UNREACHED).then(|| self.build_route(g, sources, best, best_node, stats))
+    }
+
+    pub fn alt(&mut self, g: &Graph, lm: &alt::Landmarks, source: u32, target: u32) -> Option<Route> {
+        self.alt_multi(g, lm, &[(source, 0)], &[(target, 0)])
     }
 
     /// Milliseconds from `v` to the goal at the fastest speed anything in the
