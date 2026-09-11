@@ -148,6 +148,37 @@ pub fn from_pbf(path: &Path) -> osmpbf::Result<Vec<Feature>> {
         }
     }
 
+    // Most features carry no addr:* tags at all - 186 of 2,899 in this extract.
+    // But OSM does map each sector as a `place=suburb` named "Sector 43", and
+    // Chandigarh's sectors are a regular grid of roughly 800 x 1200 m, so the
+    // nearest sector centre is a good guess at which sector something is in.
+    //
+    // ponytail: nearest-anchor assignment is a Voronoi approximation of the
+    // real sector boundaries. It will be wrong for something right on a
+    // dividing V3 road. Real sector polygons from the OSM boundary relations
+    // are the upgrade if that ever matters.
+    let anchors: Vec<(Sector, f64, f64)> = features
+        .iter()
+        .filter(|f| matches!(f.kind.as_str(), "suburb" | "neighbourhood" | "quarter"))
+        .filter_map(|f| f.sector.map(|s| (s, f.lon, f.lat)))
+        .collect();
+    if !anchors.is_empty() {
+        for f in features.iter_mut() {
+            if f.sector.is_some() {
+                continue;
+            }
+            let best = anchors
+                .iter()
+                .map(|(s, lon, lat)| (*s, graph::haversine((f.lon, f.lat), (*lon, *lat))))
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((s, d)) = best {
+                if d < 900.0 {
+                    f.sector = Some(s);
+                }
+            }
+        }
+    }
+
     // Same name, same kind, within a few metres: one thing mapped twice.
     features.sort_by(|a, b| {
         a.name

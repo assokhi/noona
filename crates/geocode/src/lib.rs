@@ -217,6 +217,17 @@ impl Index {
             .collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score));
         hits.truncate(limit);
+
+        // A sector that filtered everything out is usually a sector we have no
+        // data for, not a query with no answer. Retry on the name alone rather
+        // than returning nothing, but say so by scoring the results lower.
+        if hits.is_empty() && addr.sector.is_some() {
+            let mut wider = self.search(&addr.text, limit, near);
+            for h in wider.iter_mut() {
+                h.score *= 0.5;
+            }
+            return wider;
+        }
         hits
     }
 
@@ -360,5 +371,17 @@ mod tests {
     fn nonsense_returns_nothing_rather_than_the_least_bad_thing() {
         let idx = index();
         assert!(idx.search("zzzzqqqq", 5, None).is_empty());
+        // And a sector we have nothing for is still nothing, not noise.
+        assert!(idx.search("zzzzqqqq sector 55", 5, None).is_empty());
+    }
+
+    #[test]
+    fn an_empty_sector_falls_back_to_the_name() {
+        let idx = index();
+        // Nothing is tagged Sector 55, but Elante Mall is still what was meant.
+        let hits = idx.search("elante mall sector 55", 3, None);
+        assert_eq!(hits[0].feature.name, "Elante Mall");
+        // Scored down, because the sector could not be honoured.
+        assert!(hits[0].score < idx.search("elante mall", 3, None)[0].score);
     }
 }
