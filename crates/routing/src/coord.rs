@@ -17,6 +17,8 @@ pub enum Alg {
     Bidir,
     /// A* with landmark bounds. Needs the landmark tables loaded.
     Alt,
+    /// Contraction hierarchies. Needs the contracted graph loaded.
+    Ch,
 }
 
 impl Alg {
@@ -29,6 +31,7 @@ impl Alg {
             Alg::Astar => "astar",
             Alg::Bidir => "bidir",
             Alg::Alt => "alt",
+            Alg::Ch => "ch",
         }
     }
 }
@@ -41,6 +44,7 @@ impl std::str::FromStr for Alg {
             "astar" | "a*" => Ok(Alg::Astar),
             "bidir" | "bidirectional" => Ok(Alg::Bidir),
             "alt" => Ok(Alg::Alt),
+            "ch" => Ok(Alg::Ch),
             _ => Err(()),
         }
     }
@@ -167,16 +171,23 @@ pub fn route(
     to: Snap,
     alg: Alg,
 ) -> Option<CoordRoute> {
-    route_with(search, g, m, None, from, to, alg)
+    route_with(search, g, m, Prepared::default(), from, to, alg)
 }
 
-/// As `route`, with landmark tables available. `Alg::Alt` needs them; every
-/// other algorithm ignores them.
+/// Preprocessed structures a query may need. Each algorithm that requires one
+/// refuses to run without it rather than silently answering with another.
+#[derive(Clone, Copy, Default)]
+pub struct Prepared<'a> {
+    pub landmarks: Option<&'a crate::alt::Landmarks>,
+    pub ch: Option<&'a crate::ch::Ch>,
+}
+
+/// As `route`, with preprocessed structures available.
 pub fn route_with(
     search: &mut Search,
     g: &Graph,
     m: &Metric,
-    lm: Option<&crate::alt::Landmarks>,
+    prepared: Prepared<'_>,
     from: Snap,
     to: Snap,
     alg: Alg,
@@ -193,10 +204,35 @@ pub fn route_with(
         Alg::Bidir => search.bidirectional_multi(g, &sources, &targets),
         Alg::Alt => search.alt_multi(
             g,
-            lm.expect("Alg::Alt needs landmark tables; use route_with"),
+            prepared.landmarks.expect("Alg::Alt needs landmark tables"),
             &sources,
             &targets,
         ),
+        // CH returns original edge ids after unpacking, so the rest of this
+        // function treats it exactly like any other search result.
+        Alg::Ch => search
+            .ch_multi(
+                prepared.ch.expect("Alg::Ch needs a contracted graph"),
+                &sources,
+                &targets,
+            )
+            .map(|(cost_ms, edges, stats)| {
+                let distance_m = edges.iter().map(|e| g.length[*e as usize] as f64).sum();
+                let from_node = edges
+                    .first()
+                    .map_or(sources[0].0, |e| g.edge_source(*e as usize));
+                let to_node = edges
+                    .last()
+                    .map_or(targets[0].0, |e| g.head[*e as usize]);
+                crate::Route {
+                    cost_ms,
+                    distance_m,
+                    edges,
+                    from_node,
+                    to_node,
+                    stats,
+                }
+            }),
     }?;
 
     // The adjacent-edge trap: when the two snapped edges share a node, going

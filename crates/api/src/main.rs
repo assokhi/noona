@@ -39,6 +39,8 @@ struct AppState {
     /// Present only if landmarks.bin was found. `alg=alt` is refused rather
     /// than silently falling back when it is missing.
     landmarks: Option<Arc<routing::alt::Landmarks>>,
+    /// The contracted graph, if ch.bin was found.
+    ch: Option<Arc<routing::ch::Ch>>,
     metric: Metric,
     pool: Arc<Pool>,
     metrics: Metrics,
@@ -59,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut graph_path = PathBuf::from("data/build/graph.bin");
     let mut landmarks_path = PathBuf::from("data/build/landmarks.bin");
+    let mut ch_path = PathBuf::from("data/build/ch.bin");
     let mut addr = "127.0.0.1:8080".to_string();
     let mut pool_size = std::thread::available_parallelism()
         .map_or(8, |n| n.get())
@@ -70,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match flag.as_str() {
             "--graph" => graph_path = PathBuf::from(v),
             "--landmarks" => landmarks_path = PathBuf::from(v),
+            "--ch" => ch_path = PathBuf::from(v),
             "--addr" => addr = v.clone(),
             "--pool" => pool_size = v.parse()?,
             other => return Err(format!("unknown flag {other}").into()),
@@ -108,6 +112,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let ch = match routing::ch::Ch::load(&ch_path) {
+        Ok((ch, hash)) if hash == source_hash => {
+            tracing::info!(shortcuts = ch.n_shortcuts(), "contraction hierarchy loaded");
+            Some(Arc::new(ch))
+        }
+        Ok(_) => {
+            tracing::warn!(path = %ch_path.display(), "CH was built for a different graph, ignoring it");
+            None
+        }
+        Err(e) => {
+            tracing::info!("no contraction hierarchy ({e}); alg=ch will be refused");
+            None
+        }
+    };
+
     let pool = Pool::new(pool_size, g.n_nodes());
     tracing::info!(
         nodes = g.n_nodes(),
@@ -124,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         graph: Arc::new(g),
         grid: Arc::new(grid),
         landmarks,
+        ch,
         metric,
         pool,
         metrics: Metrics::default(),
@@ -162,6 +182,7 @@ async fn healthz(State(s): State<Shared>) -> impl IntoResponse {
         "edges": s.graph.n_edges(),
         "pool": s.pool.size,
         "landmarks": s.landmarks.as_ref().map(|l| l.count()),
+        "ch_shortcuts": s.ch.as_ref().map(|c| c.n_shortcuts()),
     }))
 }
 
@@ -273,14 +294,22 @@ async fn route_inner(s: &AppState, q: HashMap<String, String>) -> Result<Value, 
     s.metrics.pool_wait(waited.as_secs_f64());
 
     let search_start = Instant::now();
-    if alg == routing::coord::Alg::Alt && s.landmarks.is_none() {
-        return Err(ApiError::UnknownAlgorithm {
-            got: "alt (no landmarks.bin loaded)".into(),
-        });
+    // Refuse rather than silently answering with a different algorithm.
+    let missing = match alg {
+        routing::coord::Alg::Alt if s.landmarks.is_none() => Some("alt (no landmarks.bin)"),
+        routing::coord::Alg::Ch if s.ch.is_none() => Some("ch (no ch.bin)"),
+        _ => None,
+    };
+    if let Some(got) = missing {
+        return Err(ApiError::UnknownAlgorithm { got: got.into() });
     }
-    let lm = s.landmarks.as_deref();
-    let found = lease
-        .with(|search| routing::coord::route_with(search, &s.graph, &s.metric, lm, from, to, alg));
+    let prepared = routing::coord::Prepared {
+        landmarks: s.landmarks.as_deref(),
+        ch: s.ch.as_deref(),
+    };
+    let found = lease.with(|search| {
+        routing::coord::route_with(search, &s.graph, &s.metric, prepared, from, to, alg)
+    });
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
     let r = found.ok_or(ApiError::Unreachable)?;

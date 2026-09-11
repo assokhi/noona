@@ -18,7 +18,8 @@ const USAGE: &str = "usage: bench gen  [--n N] [--seed S] [--graph graph.bin] [-
                      \x20      bench run  [--alg a,b,c] [--pairs od.json] [--graph graph.bin] [--reference alg] [--json out.json]\n\
                      \x20      bench snap [--n N] [--seed S] [--graph graph.bin]\n\
                      \x20      bench coord [--pairs od.json] [--graph graph.bin]\n\
-                     \x20      bench landmarks [--k 16] [--graph graph.bin] [--landmarks landmarks.bin]";
+                     \x20      bench landmarks [--k 16] [--graph graph.bin] [--landmarks landmarks.bin]\n\
+                     \x20      bench ch [--graph graph.bin] [--ch ch.bin]";
 
 /// Pairs are stored by OSM node id, not by internal index. Internal ids are
 /// dense positions that move whenever the graph is rebuilt; the point of a
@@ -73,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut json_out: Option<PathBuf> = None;
     let mut by_coord = false;
     let mut landmarks_path = PathBuf::from("data/build/landmarks.bin");
+    let mut ch_path = PathBuf::from("data/build/ch.bin");
     let mut k = routing::alt::DEFAULT_LANDMARKS;
 
     let mut rest = args.iter();
@@ -93,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--json" => json_out = Some(PathBuf::from(v)),
             "--coord" => by_coord = v == "true" || v == "1",
             "--landmarks" => landmarks_path = PathBuf::from(v),
+            "--ch" => ch_path = PathBuf::from(v),
             "--k" => k = v.parse()?,
             other => return Err(format!("unknown flag {other}\n{USAGE}").into()),
         }
@@ -108,10 +111,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             json_out.as_deref(),
             by_coord,
             &landmarks_path,
+            &ch_path,
         ),
         "snap" => snap(&graph_path, n, seed),
         "coord" => coord_gate(&graph_path, &pairs),
         "landmarks" => landmarks(&graph_path, k, &landmarks_path),
+        "ch" => build_ch(&graph_path, &ch_path),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -294,6 +299,42 @@ fn landmarks(graph_path: &Path, k: usize, out: &Path) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// Build the contraction hierarchy.
+fn build_ch(graph_path: &Path, out: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let (g, hash) = Graph::load(graph_path)?;
+    let limits = routing::ch::Limits::default();
+    let (ch, st) = routing::ch::build(&g, limits);
+    if let Some(p) = out.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    ch.save(out, hash)?;
+    println!(
+        "contracted {} nodes in {:.1} s  (hop limit {}, settled limit {})",
+        st.nodes,
+        st.prep_ms / 1000.0,
+        limits.hops,
+        limits.settled
+    );
+    println!(
+        "shortcuts       {} added over {} original edges (+{:.1}%)",
+        st.shortcuts,
+        st.original_edges,
+        100.0 * st.shortcuts as f64 / st.original_edges as f64
+    );
+    println!(
+        "witness search  {} run, {} found a witness ({:.1}% avoided a shortcut)",
+        st.witness_searches,
+        st.witnesses_found,
+        100.0 * st.witnesses_found as f64 / st.witness_searches.max(1) as f64
+    );
+    println!(
+        "hierarchy       max level {}, {:.2} upward arcs per node",
+        st.max_level, st.arcs_per_node
+    );
+    println!("{} bytes -> {}", std::fs::metadata(out)?.len(), out.display());
+    Ok(())
+}
+
 /// Either end of the comparison: node ids, or the snapped coordinates the API
 /// actually serves. `--coord` makes the in-process baseline do exactly the work
 /// the HTTP handler does, so the difference between them is purely transport.
@@ -308,12 +349,11 @@ enum Ends {
 fn route(
     search: &mut Search,
     g: &Graph,
-    lm: Option<&routing::alt::Landmarks>,
+    prepared: routing::coord::Prepared<'_>,
     ends: &Ends,
     i: usize,
     alg: &str,
 ) -> Option<(u32, routing::SearchStats)> {
-    let need_lm = || lm.expect("alt needs landmarks: run `bench landmarks` first");
     match ends {
         Ends::Nodes(v) => {
             let (s, t) = v[i];
@@ -321,7 +361,20 @@ fn route(
                 "dijkstra" => search.dijkstra(g, s, t),
                 "astar" => search.astar(g, s, t),
                 "bidir" => search.bidirectional(g, s, t),
-                "alt" => search.alt(g, need_lm(), s, t),
+                "alt" => search.alt(
+                    g,
+                    prepared
+                        .landmarks
+                        .expect("alt needs landmarks: run `bench landmarks`"),
+                    s,
+                    t,
+                ),
+                "ch" => {
+                    let ch = prepared.ch.expect("ch needs a hierarchy: run `bench ch`");
+                    return search
+                        .ch_multi(ch, &[(s, 0)], &[(t, 0)])
+                        .map(|(c, _, st)| (c, st));
+                }
                 other => panic!("unknown algorithm {other}"),
             };
             r.map(|r| (r.cost_ms, r.stats))
@@ -329,7 +382,7 @@ fn route(
         Ends::Coords(v, m) => {
             let (from, to) = v[i];
             let alg: routing::coord::Alg = alg.parse().expect("unknown algorithm");
-            routing::coord::route_with(search, g, m, lm, from, to, alg)
+            routing::coord::route_with(search, g, m, prepared, from, to, alg)
                 .map(|r| (r.cost_ms, r.stats))
         }
     }
@@ -344,6 +397,7 @@ fn run(
     json_out: Option<&Path>,
     by_coord: bool,
     landmarks_path: &Path,
+    ch_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (g, graph_hash) = Graph::load(graph_path)?;
     let set: PairSet = serde_json::from_slice(&std::fs::read(pairs_path)?)?;
@@ -382,7 +436,21 @@ fn run(
     // The reference costs every other algorithm must match exactly.
     // Only loaded when something asks for it, so the other algorithms do not
     // need preprocessing to exist.
-    let lm = if algs.split(',').any(|a| a.trim() == "alt") || reference == "alt" {
+    let wants = |name: &str| algs.split(',').any(|a| a.trim() == name) || reference == name;
+    let ch = if wants("ch") {
+        let (ch, ch_hash) = routing::ch::Ch::load(ch_path)?;
+        if ch_hash != graph_hash {
+            return Err(format!(
+                "{} was built for a different graph - rerun `bench ch`",
+                ch_path.display()
+            )
+            .into());
+        }
+        Some(ch)
+    } else {
+        None
+    };
+    let lm = if wants("alt") {
         let (lm, lm_hash) = routing::alt::Landmarks::load(landmarks_path)?;
         if lm_hash != graph_hash {
             return Err(format!(
@@ -394,6 +462,11 @@ fn run(
         Some(lm)
     } else {
         None
+    };
+
+    let prepared = routing::coord::Prepared {
+        landmarks: lm.as_ref(),
+        ch: ch.as_ref(),
     };
 
     let ends = if by_coord {
@@ -416,7 +489,7 @@ fn run(
 
     let mut reference_cost: Vec<u32> = Vec::with_capacity(resolved.len());
     for i in 0..resolved.len() {
-        let (cost, _) = route(&mut search, &g, lm.as_ref(), &ends, i, reference)
+        let (cost, _) = route(&mut search, &g, prepared, &ends, i, reference)
             .ok_or_else(|| format!("reference {reference} found no route for pair {i}"))?;
         reference_cost.push(cost);
     }
@@ -424,7 +497,7 @@ fn run(
     // Warm up every algorithm first; these samples are thrown away.
     for alg in &names {
         for i in 0..resolved.len().min(50) {
-            let _ = route(&mut search, &g, lm.as_ref(), &ends, i, alg);
+            let _ = route(&mut search, &g, prepared, &ends, i, alg);
         }
     }
 
@@ -441,7 +514,7 @@ fn run(
             let a = (i + k) % names.len();
             // One query per timing sample, single threaded, monotonic clock.
             let start = Instant::now();
-            let r = route(&mut search, &g, lm.as_ref(), &ends, i, names[a]);
+            let r = route(&mut search, &g, prepared, &ends, i, names[a]);
             times[a].push(start.elapsed().as_secs_f64() * 1000.0);
             match r {
                 Some((cost_ms, stats)) => {
