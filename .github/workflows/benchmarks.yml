@@ -46,6 +46,18 @@ jobs:
           echo "== contraction hierarchy ==" >> bench.log
           cargo run -p bench --release -- ch 2>&1 | tee -a bench.log
 
+      - name: place index
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "== geocode index ==" >> bench.log
+          cargo run -p geocode --release -- build 2>&1 | tee -a bench.log
+          echo "== sample queries ==" >> bench.log
+          for q in "sector 17 plaza" "pgimer" "sukhna lake" "elante" "sec 43" "rock garden"; do
+            echo "-- $q" >> bench.log
+            cargo run -q -p geocode --release -- query "$q" --limit 3 2>&1 | tee -a bench.log
+          done
+
       - name: gates
         shell: bash
         run: |
