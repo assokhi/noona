@@ -23,6 +23,9 @@ it ran on.
 shortcuts; 85.5% of the shortcuts its witness search considered turned out to be
 unnecessary and were skipped.
 
+See [DEMO.md](DEMO.md) for a fifteen-minute walkthrough that needs no Rust
+toolchain.
+
 ## Run it
 
 Three things, in three shells. Windows or Linux; nothing here needs `make`.
