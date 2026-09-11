@@ -331,7 +331,11 @@ fn build_ch(graph_path: &Path, out: &Path) -> Result<(), Box<dyn std::error::Err
         "hierarchy       max level {}, {:.2} upward arcs per node",
         st.max_level, st.arcs_per_node
     );
-    println!("{} bytes -> {}", std::fs::metadata(out)?.len(), out.display());
+    println!(
+        "{} bytes -> {}",
+        std::fs::metadata(out)?.len(),
+        out.display()
+    );
     Ok(())
 }
 

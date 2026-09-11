@@ -221,9 +221,7 @@ pub fn route_with(
                 let from_node = edges
                     .first()
                     .map_or(sources[0].0, |e| g.edge_source(*e as usize));
-                let to_node = edges
-                    .last()
-                    .map_or(targets[0].0, |e| g.head[*e as usize]);
+                let to_node = edges.last().map_or(targets[0].0, |e| g.head[*e as usize]);
                 crate::Route {
                     cost_ms,
                     distance_m,
