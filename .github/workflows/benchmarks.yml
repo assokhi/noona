@@ -12,6 +12,8 @@ on:
   push:
     paths:
       - ".github/workflows/benchmarks.yml"
+      - "crates/routing/src/ch.rs"
+      - "crates/routing/src/alt.rs"
 
 permissions:
   contents: write
