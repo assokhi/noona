@@ -10,6 +10,7 @@
 //! ever inserted into the graph.
 
 pub mod alt;
+pub mod ch;
 pub mod coord;
 
 use graph::Graph;
