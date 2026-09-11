@@ -34,7 +34,7 @@ export function fromGeolocation(c: GeolocationCoordinates): LonLat {
   return lonLat(c.longitude, c.latitude);
 }
 
-export type Alg = "dijkstra" | "astar" | "bidir";
+export type Alg = "dijkstra" | "astar" | "bidir" | "alt" | "ch";
 
 export interface SnapDebug {
   edge_id: number;

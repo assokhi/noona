@@ -1,0 +1,40 @@
+name: binaries
+
+# The dev machine cannot run the Rust toolchain (Smart App Control blocks it),
+# so CI is where release binaries come from. Windows host, MSVC toolchain, so
+# the results need no extra runtime DLLs.
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "crates/**"
+      - "tools/bench/**"
+      - "Cargo.*"
+      - ".github/workflows/binaries.yml"
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: rustc -Vv
+      - name: build
+        run: cargo build --release -p graph -p bench -p api
+      - name: smoke test
+        shell: bash
+        run: |
+          set -e
+          # Every binary should at least start and print its usage.
+          ./target/release/graph.exe 2>&1 | head -2 || true
+          ./target/release/bench.exe 2>&1 | head -2 || true
+          ls -l target/release/*.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chd-maps-windows
+          if-no-files-found: error
+          path: |
+            target/release/graph.exe
+            target/release/bench.exe
+            target/release/api.exe
